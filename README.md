@@ -21,7 +21,8 @@ NetGuard/
 
 The core app needs only Python 3.10+ and the standard library. **Force offline**
 additionally needs:
-- the free **Npcap** packet driver (Wireshark/Nmap use it; the app can install it), and
+- the free **Npcap** packet driver (Wireshark/Nmap use it; the app can install it),
+- the **scapy** Python package (`pip install scapy`), and
 - the app running **as administrator** (`NetGuard-admin.bat`).
 
 ---
@@ -162,8 +163,9 @@ The app never sends credentials anywhere except to your own router.
 4. **Blocking** – it fills the filter page's own “add MAC” form and submits it,
    then re-reads the page to *verify* the MAC is listed. Unblock uses the row's
    delete control (or `…?macaddr=…&action=delete` as a fallback).
-5. **Safety** – the router itself and this computer can never be blocked; a
-   confirmation is always shown.
+5. **Safety** – the router itself and this computer can never be blocked.
+   **Block device** always asks for confirmation; **Force offline** asks
+   only for **Protected** devices.
 6. **Force offline** – sends forged ARP replies to the target and the gateway
    every 1.5 s, so neither can resolve the other; nothing is forwarded. Stopping
    the block re-announces the correct mappings several times.
@@ -171,7 +173,8 @@ The app never sends credentials anywhere except to your own router.
 Stored data lives in `%APPDATA%\NetGuard\`:
 
 - `config.json` – router URL, username, settings. The password is encrypted with
-  Windows DPAPI (only your Windows user can decrypt it).
+  Windows DPAPI (only your Windows user can decrypt it). If DPAPI fails,
+  NetGuard logs a warning and the password is stored in plain text instead.
 - `devices.json` – names, first/last seen, blocked, protected and identification state.
 
 ---

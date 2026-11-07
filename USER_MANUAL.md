@@ -128,12 +128,12 @@ Use this if you do not know the Excitel router password.
 1. Click **Run as admin** if the yellow banner is still shown.
 2. Select the device you want to disconnect.
 3. Click **Force offline**.
-4. NetGuard asks for confirmation. Click **Yes**.
+4. NetGuard does not ask for confirmation for a normal device (you can undo it at any time). If the device is **Protected**, it asks you to confirm first — click **Yes** to go ahead.
 5. Wait a few seconds and check that phone. It should still show as connected to Wi-Fi, but its internet should stop working.
 
 ### Undo it
 
-Select the same device and click **Restore connection**. It comes back almost immediately.
+Select the same device and click **Restore connection**. It should reconnect within a few seconds, up to about a minute. The log at the bottom says whether the restore packets were sent.
 
 If you have blocked more than one device, click **Restore all** at the top of the window to bring them all back at once.
 
@@ -217,7 +217,7 @@ They are saved on this computer in:
 %APPDATA%\NetGuard\
 ```
 
-The router password, if you save it, is stored using Windows encryption. It is only sent to your own router, not to the internet.
+The router password, if you save it, is stored using Windows encryption (DPAPI). If Windows encryption fails, NetGuard logs a warning saying so — the password is then stored in plain text in that file, so only rely on it on your own computer. It is only sent to your own router, not to the internet.
 
 ---
 
