@@ -196,7 +196,8 @@ class NetGuardApp(tk.Tk):
 
         self.store = Store()
         self.vendors = VendorDB(APP_DIR)
-        self.iface = netinfo.active_interface()
+        self._iface_by_label: dict[str, object] = {}
+        self.iface = netinfo.active_interface(prefer=self.store.config.get("selected_iface") or None)
         self.my_mac = normalize(self.iface.mac) if self.iface and self.iface.mac else ""
         self.gateway_mac = netinfo.gateway_mac(self.iface.gateway) if self.iface else ""
 
@@ -253,6 +254,12 @@ class NetGuardApp(tk.Tk):
         tk.Label(left, text=APP_NAME, font=(FONT, 18, "bold"), bg=HEADER_BG, fg="white").pack(anchor="w")
         self.subtitle = tk.Label(left, text="", font=(FONT, 9), bg=HEADER_BG, fg="#94A3B8")
         self.subtitle.pack(anchor="w", pady=(2, 0))
+        # Fix 7: explicit interface picker for dual-adapter / dual-router
+        # setups, instead of the old Wi-Fi-guess heuristic.
+        self.iface_var = tk.StringVar(value="")
+        self.iface_combo = ttk.Combobox(left, textvariable=self.iface_var, state="readonly", width=52)
+        self.iface_combo.pack(anchor="w", pady=(4, 0))
+        self.iface_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_iface_selected())
 
         right = tk.Frame(inner, bg=HEADER_BG)
         right.pack(side="right")
@@ -448,7 +455,14 @@ class NetGuardApp(tk.Tk):
             self._last_net_refresh = now
             old = self.iface
             try:
-                new_iface = netinfo.active_interface()
+                prefer = self.store.config.get("selected_iface") or None
+                new_iface = netinfo.active_interface(prefer=prefer)
+                if prefer and new_iface is not None and netinfo.iface_key(new_iface) not in (prefer, prefer.upper()):
+                    # Saved adapter is gone; keep using the fallback but
+                    # say so once instead of pretending the pick still holds.
+                    if getattr(self, "_iface_pref_warned", "") != prefer:
+                        self.log_line(f"Saved network adapter ({prefer}) not found — using {new_iface.name} instead.")
+                        self._iface_pref_warned = prefer
             except Exception:
                 new_iface = None
             if new_iface is not None:
@@ -491,6 +505,63 @@ class NetGuardApp(tk.Tk):
             text=f"{self.iface.name}  •  {self.iface.ip}  •  gateway {gw}  •  {net}"
         )
         self.net_badge.configure(text=f"LAN {net}", fg="#A7F3D0")
+        self._sync_iface_combo()
+
+    def _sync_iface_combo(self) -> None:
+        """Keep the header picker in step with detected adapters (Fix 7)."""
+        try:
+            ifaces = netinfo.list_interfaces()
+        except Exception:
+            ifaces = [self.iface] if self.iface else []
+        self._iface_by_label = {}
+        labels = []
+        for iface in ifaces:
+            label = f"{iface.name}  •  {iface.ip}  •  gw {iface.gateway or '—'}"
+            self._iface_by_label[label] = iface
+            labels.append(label)
+        current = None
+        for label, iface in self._iface_by_label.items():
+            if self.iface and iface.ip == self.iface.ip and iface.mac == self.iface.mac:
+                current = label
+                break
+        self.iface_combo.configure(values=labels)
+        if current:
+            self.iface_var.set(current)
+        elif not labels:
+            self.iface_var.set("")
+        elif self.iface_var.get() not in labels and self.iface:
+            self.iface_var.set(labels[0] if labels else "")
+
+    def _on_iface_selected(self) -> None:
+        """User picked an adapter in the header (Fix 7)."""
+        label = self.iface_var.get()
+        chosen = self._iface_by_label.get(label)
+        if chosen is None or chosen is self.iface:
+            return
+        if self.arp.targets:
+            count = len(self.arp.targets)
+            if not messagebox.askyesno(
+                APP_NAME,
+                f"Switching network will restore the {count} force-offline "
+                "device(s) on the current network. Continue?",
+            ):
+                self._sync_iface_combo()
+                return
+            failed = self.arp.stop()
+            for row in self.rows.values():
+                row.arp_blocked = False
+            for msg in self.arp.drain_events():
+                self.log_line(msg)
+            if failed:
+                self.log_line(f"Restore incomplete for {len(failed)} device(s) on switch.")
+        self.store.config["selected_iface"] = netinfo.iface_key(chosen)
+        self.store.save_config()
+        self.iface = chosen
+        self.my_mac = normalize(chosen.mac) if chosen.mac else ""
+        self.gateway_mac = netinfo.gateway_mac(chosen.gateway) if chosen.gateway else ""
+        self.log_line(f"Network adapter switched to {chosen.name} ({chosen.ip}).")
+        self._refresh_network_info(force=True)
+        self.start_scan(True)
 
     def _update_router_badge(self) -> None:
         state = self.router_state

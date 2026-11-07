@@ -52,11 +52,22 @@ class Interface:
         return f"<Interface {self.name} {self.ip}/{self.mask} gw={self.gateway}>"
 
 
-def active_interface() -> Interface | None:
-    """Pick the interface that owns the default route (falling back to Wi-Fi)."""
-    text = _run(["ipconfig", "/all"], timeout=8)
+_IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+_MAC_FULL_RE = re.compile(r"\b([0-9A-Fa-f]{2}(?:[-:][0-9A-Fa-f]{2}){5})\b")
+
+
+def list_interfaces(text: str | None = None) -> list[Interface]:
+    """Enumerate IPv4 interfaces from ipconfig, locale-independently.
+
+    Fix 7: the old parser matched English labels ("IPv4 Address", "Default
+    Gateway", ...), so non-English Windows returned nothing. IP addresses,
+    subnet masks and MACs are the same in every locale, so this parses
+    values by shape instead of labels.
+    """
+    if text is None:
+        text = _run(["ipconfig", "/all"], timeout=8)
     if not text:
-        return None
+        return []
 
     blocks: list[dict] = []
     current: dict | None = None
@@ -65,44 +76,70 @@ def active_interface() -> Interface | None:
         if not line.strip():
             continue
         if not line.startswith((" ", "\t")):
-            current = {"title": line.strip().rstrip(":"), "fields": {}}
+            current = {"title": line.strip().rstrip(":"), "ips": [], "macs": []}
             blocks.append(current)
             continue
         if current is None:
             continue
-        if ":" in line:
-            key, _, value = line.partition(":")
-            key = key.strip().rstrip(" .").lower()
-            current["fields"][key] = value.strip()
+        current["ips"].extend(_IPV4_RE.findall(line))
+        current["macs"].extend(_MAC_FULL_RE.findall(line))
 
     candidates: list[Interface] = []
     for block in blocks:
-        f = block["fields"]
-        ip = f.get("ipv4 address", "") or f.get("autoconfiguration ipv4 address", "")
-        if not ip:
+        ips = [ip for ip in block["ips"] if not ip.startswith("169.254.") and not ip.startswith(("0.", "255."))]
+        if not ips:
             continue
-        if "(preferred)" in ip.lower():
-            ip = ip.split("(")[0].strip()
-        if not re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+        ip = ips[0]
+        try:
+            net = ipaddress.IPv4Network(f"{ip}/24", strict=False)
+        except ValueError:
             continue
-        if ip.startswith("169.254."):
-            continue
-        mask = f.get("subnet mask", "255.255.255.0")
-        gw = f.get("default gateway", "")
-        gw = gw.split()[0] if gw else ""
-        mac = f.get("physical address", "")
-        candidates.append(
-            Interface(block["title"], ip, mask, gw, mac, block["title"])
-        )
+        masks = [v for v in block["ips"] if v.startswith("255.")]
+        mask = masks[0] if masks else "255.255.255.0"
+        try:
+            net = ipaddress.IPv4Network(f"{ip}/{mask}", strict=False)
+        except ValueError:
+            net = ipaddress.IPv4Network(f"{ip}/24", strict=False)
+        # Gateway = a different address inside our own subnet, last one wins
+        # (ipconfig lists it after the interface address).
+        gateway = ""
+        for other in ips:
+            if other != ip and ipaddress.ip_address(other) in net:
+                gateway = other
+        mac = block["macs"][0] if block["macs"] else ""
+        candidates.append(Interface(block["title"], ip, mask, gateway, mac, block["title"]))
+    return candidates
 
+
+def iface_key(iface: Interface | None) -> str:
+    """Stable id for a saved user selection (survives DHCP IP changes)."""
+    if not iface:
+        return ""
+    mac = (iface.mac or "").upper().replace("-", ":")
+    return mac or iface.ip
+
+
+def active_interface(prefer: str | None = None, text: str | None = None) -> Interface | None:
+    """Pick the interface that owns the default route (falling back to Wi-Fi).
+
+    ``prefer`` is an iface_key() (usually the physical MAC) chosen by the
+    user in the header selector; it wins over the Wi-Fi heuristic so dual-
+    router setups stop guessing wrong.
+    """
+    candidates = list_interfaces(text)
     if not candidates:
         return None
-
-    # Prefer an adapter with a default gateway; then Wi-Fi; then anything.
+    if prefer:
+        want = prefer.upper().replace("-", ":")
+        for c in candidates:
+            if (c.mac or "").upper().replace("-", ":") == want or c.ip == prefer:
+                return c
+        # Preference gone (adapter unplugged) — fall through with a clear
+        # signal to the caller instead of silently pretending it matched.
     with_gw = [c for c in candidates if c.gateway]
     pool = with_gw or candidates
     for c in pool:
-        if "wi-fi" in c.name.lower() or "wireless" in c.name.lower():
+        if "wi-fi" in c.name.lower() or "wireless" in c.name.lower() or "wlan" in c.name.lower():
             return c
     return pool[0]
 

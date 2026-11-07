@@ -78,6 +78,7 @@ DEFAULT_CONFIG = {
     "interval": 20,
     "deep_scan": False,
     "show_offline": False,
+    "selected_iface": "",
 }
 
 

@@ -38,6 +38,29 @@ def main() -> int:
     name, _ = netinfo._dns_name(packet, 12)
     check("DNS name decode", name == "33.1.168.192.in-addr.arpa", name)
 
+    # Fix 7: non-English ipconfig labels still parse (values are universal).
+    german = (
+        "Drahtloser LAN-Adapter Wi-Fi:\n"
+        "   IPv4-Adresse  . . . : 192.168.1.36\n"
+        "   Subnetzmaske  . . . : 255.255.255.0\n"
+        "   Standardgateway . . : 192.168.1.1\n"
+        "   Physische Adresse . : C4-13-75-93-DD-29\n"
+    )
+    ifaces = netinfo.list_interfaces(german)
+    check("locale-free parse finds iface", len(ifaces) == 1 and ifaces[0].ip == "192.168.1.36", str(ifaces))
+    check("locale-free parse finds gateway+mac", bool(ifaces) and ifaces[0].gateway == "192.168.1.1" and "C4" in ifaces[0].mac, str(ifaces[0] if ifaces else ""))
+    # prefer-by-MAC beats the Wi-Fi heuristic
+    two = german + (
+        "\nEthernet-Adapter Ethernet:\n"
+        "   IPv4 Address. . . : 10.0.0.5\n"
+        "   Subnet Mask . . . : 255.255.255.0\n"
+        "   Default Gateway . : 10.0.0.1\n"
+        "   Physical Address. : AA-BB-CC-DD-EE-FF\n"
+    )
+    picked = netinfo.active_interface(prefer="AA:BB:CC:DD:EE:FF", text=two)
+    check("prefer wins over heuristic", picked is not None and picked.ip == "10.0.0.5", str(picked))
+    check("iface_key is MAC", netinfo.iface_key(picked) == "AA:BB:CC:DD:EE:FF")
+
     # Live check: the router answers PTR queries for its own DHCP clients.
     iface = netinfo.active_interface()
     if iface:
