@@ -133,6 +133,72 @@ def main() -> int:
     blocker.stop()
     blocker._targets.clear()
 
+    # Fix 4: add() proves the first send before claiming success -----------
+    b2 = arpblock.ArpBlocker()
+    real_readiness = arpblock.readiness
+    arpblock.readiness = lambda iface=None: (True, "")
+    b2._resolve_iface = lambda *a, **k: "TEST"
+    sent: list = []
+    b2._send = lambda pkts: sent.extend(pkts)
+    started_threads = []
+    real_start = b2._start_thread
+    # run the real loop thread but with a fast interval via _stop waiting
+    try:
+        ok, msg = b2.add("E2:93:95:08:18:57", "192.168.1.33", iface, gateway)
+        check("add succeeds with working send", ok is True, msg)
+        check("add sent poison synchronously", len(sent) >= 2, str(len(sent)))
+        check("add target registered", b2.is_blocking("E2:93:95:08:18:57"))
+    finally:
+        # a failing send must make add() fail and register nothing
+        def boom(pkts):
+            raise RuntimeError("no adapter")
+        b2._send = boom
+        ok, msg = b2.add("AA:BB:CC:DD:EE:FF", "192.168.1.60", iface, gateway)
+        check("add fails when first send fails", ok is False and "Could not send" in msg, msg)
+        check("failed add not registered", not b2.is_blocking("AA:BB:CC:DD:EE:FF"))
+        b2.stop()
+        b2._targets.clear()
+        arpblock.readiness = real_readiness
+
+    # Fix 4: remove->add race (last target removed, new one added) ---------
+    b3 = arpblock.ArpBlocker()
+    arpblock.readiness = lambda iface=None: (True, "")
+    b3._resolve_iface = lambda *a, **k: "TEST"
+    b3._send = lambda pkts: None
+    try:
+        b3.add("E2:93:95:08:18:57", "192.168.1.33", iface, gateway)
+        check("remove() restores ok", b3.remove("E2:93:95:08:18:57") is True)
+        ok, _msg = b3.add("AA:BB:CC:DD:EE:FF", "192.168.1.60", iface, gateway)
+        check("re-add after remove succeeds", ok is True)
+        check("re-added target blocking", b3.is_blocking("AA:BB:CC:DD:EE:FF"))
+        import time as _t
+        _t.sleep(0.2)
+        check("thread still alive after re-add", b3.running is True)
+    finally:
+        b3.stop()
+        b3._targets.clear()
+        arpblock.readiness = real_readiness
+
+    # Fix 4: restore retry + honest failure --------------------------------
+    b4 = arpblock.ArpBlocker()
+    b4._gateway_ip = "192.168.1.1"
+    b4._gateway_mac = gateway
+    b4._local_mac = me
+    b4._iface_name = "TEST"
+    calls = {"n": 0}
+    def flaky_send(pkts):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise RuntimeError("flaky")
+    b4._send = flaky_send
+    check("restore succeeds after retries", b4._restore_one({"mac": "E2:93:95:08:18:57", "ip": "192.168.1.33"}) is True)
+    def dead_send(pkts):
+        raise RuntimeError("dead")
+    b4._send = dead_send
+    check("restore reports failure", b4._restore_one({"mac": "E2:93:95:08:18:57", "ip": "192.168.1.33"}) is False)
+    check("restore failure event", any("Restore packets failed" in e for e in b4.drain_events()))
+    b4.stop()
+
     print()
     print("FAILED: " + ", ".join(FAILS) if FAILS else "ALL ARP TESTS PASSED")
     return 1 if FAILS else 0

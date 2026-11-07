@@ -82,6 +82,10 @@ Limits, honestly:
 
 - The block ends when NetGuard is closed, or the PC sleeps/disconnects. That is
   by design: closing the app restores every device.
+- **Clean close only.** If NetGuard crashes, is killed from Task Manager, or
+  the PC loses power, no restore packets can be sent. The device then stays
+  offline until its ARP cache expires — typically ~30–60 s, up to ~2 min on
+  some IoT gear. It cannot stay offline forever: nothing is persisted.
 - The router still counts the device as connected; it simply gets no traffic.
 - IPv4 only. This LAN has no IPv6, which is why the method is reliable here.
 - Some antivirus products flag ARP manipulation, because attackers use the same

@@ -14,6 +14,8 @@ Requirements on Windows:
 
 The block only lasts while NetGuard is running and the computer stays on the
 network.  ``stop()`` (and app shutdown) restores the correct ARP mappings.
+A crash / kill / power loss cannot send restore packets: the device then
+recovers when its ARP cache expires (~30-60 s, up to ~2 min on some IoT).
 """
 
 from __future__ import annotations
@@ -243,28 +245,57 @@ class ArpBlocker:
             return False, message
 
         with self._lock:
-            self._targets[mac] = {"mac": mac, "ip": ip}
+            target = {"mac": mac, "ip": ip}
+            self._targets[mac] = target
             self._gateway_ip = iface.gateway
             self._gateway_mac = normalize(gateway_mac)
             self._local_mac = normalize(iface.mac or "")
             self._local_ip = iface.ip or ""
             self._iface_name = self._resolve_iface(ip)
+            gateway_ip = self._gateway_ip
+            gateway_mac_norm = self._gateway_mac
+            local_mac = self._local_mac
+            iface_name = self._iface_name
 
         self._start_thread()
+        # Fix 4 (F4): prove the first poison send actually works *before*
+        # telling the user it succeeded. Previously add() returned True the
+        # moment the thread started, so a dead socket/adapter showed as
+        # "forced offline" while nothing was sent.
+        try:
+            self._poison(target, gateway_ip, gateway_mac_norm, local_mac, iface_name)
+        except Exception as exc:
+            self._last_error = str(exc)
+            with self._lock:
+                self._targets.pop(mac, None)
+            self._close_socket()
+            return False, f"Could not send the blocking packets: {exc}"
         return True, f"Forcing {ip} offline."
 
-    def remove(self, mac: str) -> None:
+    def remove(self, mac: str) -> bool:
+        """Stop blocking one device and restore it. Returns restore success.
+
+        Returns True when nothing was blocked or the restore packets were
+        sent; False when the restore could not be sent (see events).
+        """
         mac = normalize(mac)
         with self._lock:
             target = self._targets.pop(mac, None)
             empty = not self._targets
+        ok = True
         if target:
-            self._restore_one(target)
+            ok = self._restore_one(target)
         if empty:
             self._close_socket()
+        return ok
 
-    def stop(self) -> None:
-        """Stop poisoning and put every ARP table back."""
+    def stop(self) -> list[str]:
+        """Stop poisoning and put every ARP table back.
+
+        Returns the list of MACs whose restore packets failed (empty = all
+        restored). Callers should log this instead of assuming success
+        (Fix 4, F7).
+        """
         self._stop.set()
         thread = self._thread
         if thread and thread.is_alive():
@@ -273,9 +304,12 @@ class ArpBlocker:
         with self._lock:
             remaining = list(self._targets.values())
             self._targets.clear()
+        failed: list[str] = []
         for target in remaining:
-            self._restore_one(target)
+            if not self._restore_one(target):
+                failed.append(target["mac"])
         self._close_socket()
+        return failed
 
     # -- internals --------------------------------------------------------
     def _resolve_iface(self, ip: str) -> str | None:
@@ -297,9 +331,13 @@ class ArpBlocker:
         return None
 
     def _start_thread(self) -> None:
+        # Fix 4 (F8): clear the stop flag first. After stop() (or a timed-out
+        # join on a hung send), the old thread may still be alive with _stop
+        # set; clearing it resurrects that thread for the new target instead
+        # of leaving the new target unpoisoned.
+        self._stop.clear()
         if self.running:
             return
-        self._stop.clear()
         self._thread = threading.Thread(target=self._loop, name="arpblock", daemon=True)
         self._thread.start()
 
@@ -313,7 +351,12 @@ class ArpBlocker:
                     local_mac = self._local_mac
                     iface_name = self._iface_name
                 if not targets or not gateway_ip:
-                    break
+                    # Fix 4 (F8): idle-wait instead of exiting. The old
+                    # "break" raced with add(): remove-last made the loop
+                    # exit, and the next add() saw running=True and started
+                    # nothing — a target that looked blocked but never was.
+                    self._stop.wait(INTERVAL)
+                    continue
 
                 # Safety: if an address was handed to a different device, stop
                 # poisoning it so the new owner is not blocked by accident.
@@ -388,21 +431,42 @@ class ArpBlocker:
             self._close_socket()
             self._send([to_target, to_gateway])
 
-    def _restore_one(self, target: dict) -> None:
-        """Re-announce the true mappings so the two sides can talk again."""
-        if not (self._gateway_ip and self._gateway_mac):
-            return
-        try:
-            from scapy.all import ARP, Ether
+    def _restore_one(self, target: dict) -> bool:
+        """Re-announce true mappings; retry on failure. Returns success.
 
-            ip = target["ip"]
-            mac = target["mac"]
-            to_target = Ether(dst=mac, src=self._gateway_mac) / ARP(
-                op=2, hwsrc=self._gateway_mac, psrc=self._gateway_ip, hwdst=mac, pdst=ip,
-            )
-            to_gateway = Ether(dst=self._gateway_mac, src=mac) / ARP(
-                op=2, hwsrc=mac, psrc=ip, hwdst=self._gateway_mac, pdst=self._gateway_ip,
-            )
-            self._send([to_target, to_gateway] * 3)
-        except Exception as exc:
-            self._last_error = str(exc)
+        Fix 4 (F7): previously this sent once and swallowed errors, so a
+        failed restore still showed as restored. Now it retries (rebuilding
+        a stale socket between attempts), records a visible event on
+        ultimate failure, and reports the outcome to the caller.
+        Note: "sent" is the strongest claim we can make from this machine —
+        some stacks ignore unsolicited ARP replies, in which case the
+        device still recovers when its ARP cache expires (~30-60 s).
+        """
+        if not (self._gateway_ip and self._gateway_mac):
+            self._last_error = "Cannot restore: gateway MAC unknown."
+            self._events.append("⚠ Restore skipped: gateway MAC unknown — device may take ~60s to recover.")
+            return False
+        last_exc: Exception | None = None
+        for _attempt in range(3):
+            try:
+                from scapy.all import ARP, Ether
+
+                ip = target["ip"]
+                mac = target["mac"]
+                to_target = Ether(dst=mac, src=self._gateway_mac) / ARP(
+                    op=2, hwsrc=self._gateway_mac, psrc=self._gateway_ip, hwdst=mac, pdst=ip,
+                )
+                to_gateway = Ether(dst=self._gateway_mac, src=mac) / ARP(
+                    op=2, hwsrc=mac, psrc=ip, hwdst=self._gateway_mac, pdst=self._gateway_ip,
+                )
+                self._send([to_target, to_gateway] * 3)
+                return True
+            except Exception as exc:
+                last_exc = exc
+                self._close_socket()
+        self._last_error = str(last_exc or "unknown")
+        self._events.append(
+            f"⚠ Restore packets failed for {target['ip']} ({target['mac']}): {last_exc} "
+            "— the device may stay offline up to ~60s until caches expire."
+        )
+        return False

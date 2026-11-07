@@ -141,6 +141,8 @@ If you have blocked more than one device, click **Restore all** at the top of th
 
 Closing NetGuard stops all force-offline blocking and restores everyone. That is intentional and safe.
 
+> **Important:** this restore only works on a clean close. If NetGuard crashes, you kill it in Task Manager, or the PC loses power, the device stays offline until its network cache expires — usually 30–60 seconds, sometimes up to about 2 minutes. It always comes back on its own; the block is never saved permanently.
+
 ---
 
 ## Permanent router block (needs the router password)

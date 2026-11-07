@@ -973,10 +973,15 @@ class NetGuardApp(tk.Tk):
             return
 
         if row.arp_blocked:
-            self.arp.remove(row.mac)
+            restored = self.arp.remove(row.mac)
             row.arp_blocked = False
-            self.log_line(f"Connection restored for {row.title} ({row.mac}).")
-            self.footer.configure(text="Connection restored")
+            if restored:
+                self.log_line(f"Restore packets sent for {row.title} ({row.mac}) — it should reconnect within ~60s.")
+                self.footer.configure(text="Connection restored")
+            else:
+                for msg in self.arp.drain_events():
+                    self.log_line(msg)
+                self.footer.configure(text="Restore packets failed — see log; device may take ~60s")
             self.render()
             self._update_arp_indicator()
             return
@@ -1034,11 +1039,17 @@ class NetGuardApp(tk.Tk):
             return
         if not messagebox.askyesno(APP_NAME, f"Restore the connection for all {count} blocked device(s)?"):
             return
-        self.arp.stop()
+        failed = self.arp.stop()
         for row in self.rows.values():
             row.arp_blocked = False
-        self.log_line(f"Restored {count} device(s).")
-        self.footer.configure(text="All devices restored")
+        for msg in self.arp.drain_events():
+            self.log_line(msg)
+        if failed:
+            self.log_line(f"Restore incomplete: {len(failed)} device(s) failed ({', '.join(failed)}) — see above.")
+            self.footer.configure(text=f"Restore failed for {len(failed)} device(s) — see log")
+        else:
+            self.log_line(f"Restore packets sent for {count} device(s) — they should reconnect within ~60s.")
+            self.footer.configure(text="All devices restored")
         self.render()
         self._update_arp_indicator()
 
