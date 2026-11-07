@@ -645,6 +645,13 @@ class NetGuardApp(tk.Tk):
             entry["connection"] = c.get("connection", "")
             entry["source"] = "both" if entry["ip"] else "router"
 
+        # Fix 2: follow force-offline targets across DHCP IP changes, and
+        # release any whose old IP was handed to a different device. Needs
+        # the merged ARP + router view, so it runs after raw is complete.
+        if self.arp.targets:
+            observed = {mac: info["ip"] for mac, info in raw.items() if info.get("ip")}
+            self.arp.refresh_targets(observed)
+
         self.store.merge_scan(raw)
         now = time.time()
         new_macs = [mac for mac in raw if mac not in self.rows] if self.rows else []

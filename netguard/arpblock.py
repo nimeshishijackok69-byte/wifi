@@ -89,6 +89,7 @@ class ArpBlocker:
         self._targets: dict[str, dict] = {}  # mac -> {ip, mac}
         self._iface_name: str | None = None
         self._local_mac = ""
+        self._local_ip = ""
         self._gateway_ip = ""
         self._gateway_mac = ""
         self._last_error = ""
@@ -154,10 +155,13 @@ class ArpBlocker:
                 or (new_gw_mac and self._gateway_mac != new_gw_mac)
                 or (new_local and self._local_mac != new_local)
                 or (new_iface_name and self._iface_name != new_iface_name)
+                or (iface.ip and self._local_ip != iface.ip)
             )
             if not changed:
                 return False
             self._gateway_ip = iface.gateway
+            if iface.ip:
+                self._local_ip = iface.ip
             if new_gw_mac:
                 self._gateway_mac = new_gw_mac
             if new_local:
@@ -171,6 +175,56 @@ class ArpBlocker:
             )
         self._close_socket()
         return True
+
+    def refresh_targets(self, observed: dict[str, str]) -> None:
+        """Follow blocked devices when DHCP moves them to a new IP (Fix 2).
+
+        Previously the IP was pinned at add() time forever: if the phone got
+        a new lease it came back online while the app kept poisoning the old
+        address — and if that old address was handed to someone else, the new
+        owner was blocked instead. The app now calls this after every scan
+        with the merged MAC->IP view (ARP sweep + router DHCP list):
+
+        * same MAC, new IP  -> point the poison at the new IP, log it.
+        * old IP now owned by a different MAC -> release without poisoning
+          the new owner (the poisoned cache entries expire on their own).
+        * target not seen at all -> keep blocking the old IP; a single
+          missed scan never releases a device.
+        """
+        norm_observed: dict[str, str] = {}
+        for mac, ip in observed.items():
+            if not mac or not ip or ip.startswith(("0.", "255.")):
+                continue
+            norm_observed[normalize(mac)] = ip
+        if not norm_observed:
+            return
+        ip_to_mac = {ip: mac for mac, ip in norm_observed.items()}
+        with self._lock:
+            for mac, target in list(self._targets.items()):
+                if mac in norm_observed:
+                    new_ip = norm_observed[mac]
+                    # Never adopt an address that belongs to us or the router.
+                    if new_ip in (self._gateway_ip, self._local_ip) or new_ip == target["ip"]:
+                        continue
+                    old_ip = target["ip"]
+                    target["ip"] = new_ip
+                    self._events.append(
+                        f"{mac} moved {old_ip} -> {new_ip}; still forced offline (now on {new_ip})."
+                    )
+                elif target["ip"] in ip_to_mac:
+                    # Somebody else owns the old IP now — do not block them.
+                    old_ip = target["ip"]
+                    owner = ip_to_mac[old_ip]
+                    del self._targets[mac]
+                    self._events.append(
+                        f"{old_ip} now belongs to {owner}; stopped blocking {mac} "
+                        "so the new owner is not cut off."
+                    )
+
+    def target_ip(self, mac: str) -> str:
+        with self._lock:
+            target = self._targets.get(normalize(mac))
+            return target["ip"] if target else ""
 
     # -- lifecycle --------------------------------------------------------
     def add(self, mac: str, ip: str, iface: netinfo.Interface, gateway_mac: str) -> tuple[bool, str]:
@@ -193,6 +247,7 @@ class ArpBlocker:
             self._gateway_ip = iface.gateway
             self._gateway_mac = normalize(gateway_mac)
             self._local_mac = normalize(iface.mac or "")
+            self._local_ip = iface.ip or ""
             self._iface_name = self._resolve_iface(ip)
 
         self._start_thread()

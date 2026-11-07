@@ -106,6 +106,33 @@ def main() -> int:
     blocker.stop()
     blocker._targets.clear()
 
+    # Fix 2: target follows a DHCP IP change --------------------------------
+    blocker._gateway_ip = "192.168.1.1"
+    blocker._gateway_mac = gateway
+    blocker._local_ip = "192.168.1.36"
+    blocker._local_mac = me
+    blocker._targets["E2:93:95:08:18:57"] = {"mac": "E2:93:95:08:18:57", "ip": "192.168.1.33"}
+    blocker.refresh_targets({"E2:93:95:08:18:57": "192.168.1.50"})
+    check("follows new IP", blocker.target_ip("E2:93:95:08:18:57") == "192.168.1.50")
+    check("follow event logged", any("192.168.1.33" in e and "192.168.1.50" in e for e in blocker.drain_events()))
+
+    # Fix 2: never adopt gateway / own IP -----------------------------------
+    blocker.refresh_targets({"E2:93:95:08:18:57": "192.168.1.1"})
+    check("refuses gateway IP", blocker.target_ip("E2:93:95:08:18:57") == "192.168.1.50")
+
+    # Fix 2: unseen device stays blocked ------------------------------------
+    blocker.refresh_targets({})
+    check("empty scan keeps target", blocker.is_blocking("E2:93:95:08:18:57"))
+    blocker.refresh_targets({"AA:BB:CC:DD:EE:FF": "192.168.1.60"})
+    check("unrelated scan keeps target", blocker.target_ip("E2:93:95:08:18:57") == "192.168.1.50")
+
+    # Fix 2: IP handed to another device -> release, don't block new owner --
+    blocker.refresh_targets({"AA:BB:CC:DD:EE:FF": "192.168.1.50"})
+    check("releases on takeover", not blocker.is_blocking("E2:93:95:08:18:57"))
+    check("release event logged", any("stopped blocking" in e for e in blocker.drain_events()))
+    blocker.stop()
+    blocker._targets.clear()
+
     print()
     print("FAILED: " + ", ".join(FAILS) if FAILS else "ALL ARP TESTS PASSED")
     return 1 if FAILS else 0
