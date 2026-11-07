@@ -82,6 +82,22 @@ def main() -> int:
         # The (unverified) add really landed on the mock; clean up.
         check("unverified add did land", target in router.blocked_macs())
         router.set_block(target, False)
+
+        # Fix 5: a full filter never overwrites an occupied slot.
+        from netguard.router import parse_page
+        full_html = (
+            '<form action="/boaform/admin/formWlanMacFilter" method="post">'
+            '<input type="text" name="macaddr1" value="AA:BB:CC:DD:EE:FF">'
+            '<input type="text" name="macaddr2" value="11:22:33:44:55:66">'
+            "</form>"
+        )
+        page = parse_page(full_html)
+        ok5, msg5 = router._add_mac(page, target)
+        check("full filter refuses overwrite", ok5 is False and "no empty slot" in msg5.lower(), msg5)
+        # An already-blocked MAC is idempotent, not an error.
+        dup_html = full_html.replace("AA:BB:CC:DD:EE:FF", target)
+        ok6, msg6 = router._add_mac(parse_page(dup_html), target)
+        check("already-blocked is idempotent", ok6 is True, msg6)
     finally:
         server.stop()
 

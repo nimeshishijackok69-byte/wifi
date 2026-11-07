@@ -583,13 +583,24 @@ class HuaweiRouter(BaseRouter):
         _score, form, field_names = candidates[0]
         data = form.default_data()
 
+        # Fix 5: never overwrite an occupied slot. The old code fell back to
+        # field_names[0] when every slot was full, silently unblocking
+        # whoever lived there. Fail honestly instead — unless the MAC is
+        # already listed, in which case the block is already in place.
+        for name in field_names:
+            existing = str(form.value(name)).strip()
+            if existing and norm_mac(existing) == mac:
+                return True, "Already blocked"
         target = None
         for name in field_names:
             if not str(form.value(name)).strip():
                 target = name
                 break
         if target is None:
-            target = field_names[0]
+            return False, (
+                "The router's MAC filter has no empty slot left. "
+                "Unblock a device (or clear the filter on the router) and retry."
+            )
 
         replaced = False
         new_data = []

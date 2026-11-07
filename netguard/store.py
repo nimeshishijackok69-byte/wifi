@@ -121,6 +121,15 @@ class Store:
         else:
             self.config["password_token"] = ""
 
+    @property
+    def password_is_plain(self) -> bool:
+        """True when DPAPI failed and the token is stored in clear text.
+
+        Fix 5: _protect() silently fell back to "plain:" — callers must
+        surface that instead of claiming DPAPI encryption.
+        """
+        return str(self.config.get("password_token", "")).startswith("plain:")
+
     # -- device records ---------------------------------------------------
     def record(self, mac: str) -> dict:
         return self.devices.setdefault(mac, {"name": "", "first_seen": 0, "last_seen": 0, "blocked": False})

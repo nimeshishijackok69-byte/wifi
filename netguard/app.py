@@ -173,6 +173,9 @@ class SettingsDialog(tk.Toplevel):
         self.app.store.config["username"] = user
         self.app.store.config["remember_password"] = self.remember.get()
         self.app.store.password = pwd
+        if self.app.store.password_is_plain:
+            # Fix 5: DPAPI failed — the password is on disk in clear text.
+            self.app.log_line("⚠ Router password could NOT be encrypted (DPAPI failed) and is stored in plain text in config.json.")
         self.app.store.save_config()
 
         self.status.configure(text="Connecting to the router…", fg=MUTED)
@@ -1251,11 +1254,12 @@ class NetGuardApp(tk.Tk):
         try:
             with open(path, "w", newline="", encoding="utf-8") as fh:
                 writer = csv.writer(fh)
-                writer.writerow(["Name", "Likely device", "Evidence", "IP", "MAC", "Vendor", "Type", "Online", "Blocked", "First seen", "Last seen"])
+                writer.writerow(["Name", "Likely device", "Evidence", "IP", "MAC", "Vendor", "Type", "Online", "Blocked (router)", "Forced offline (ARP)", "First seen", "Last seen"])
                 for row in sorted(self.rows.values(), key=lambda r: (r.name or r.ip)):
                     writer.writerow([row.title, row.guess or "Unknown device", "; ".join(row.evidence),
                                      row.ip, row.mac, row.vendor, row.kind,
                                      "yes" if row.online else "no", "yes" if row.blocked else "no",
+                                     "yes" if row.arp_blocked else "no",
                                      human(row.first_seen), human(row.last_seen)])
             self.footer.configure(text=f"Exported to {path}")
         except Exception as exc:
