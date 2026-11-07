@@ -82,6 +82,30 @@ def main() -> int:
     finally:
         blocker._send = original
 
+    # Fix 1: health snapshot -------------------------------------------------
+    blocker._targets.clear()
+    blocker.stop()
+    h = blocker.health()
+    check("health idle", h["running"] is False and h["targets"] == 0, str(h))
+    blocker._last_error = "boom"
+    check("health surfaces error", blocker.health()["last_error"] == "boom")
+    blocker.clear_error()
+    check("clear_error", blocker.health()["last_error"] == "")
+
+    # Fix 1: refresh adopts a changed gateway/interface ---------------------
+    blocker._gateway_ip = "192.168.1.1"
+    blocker._gateway_mac = gateway
+    blocker._local_mac = me
+    blocker._iface_name = "OLD"
+    blocker._resolve_iface = lambda *a, **k: "NEW"
+    changed = blocker.refresh(iface, gateway)
+    check("refresh detects change", changed is True)
+    check("refresh adopted iface", blocker._iface_name == "NEW")
+    changed2 = blocker.refresh(iface, gateway)
+    check("refresh no-op when unchanged", changed2 is False)
+    blocker.stop()
+    blocker._targets.clear()
+
     print()
     print("FAILED: " + ", ".join(FAILS) if FAILS else "ALL ARP TESTS PASSED")
     return 1 if FAILS else 0

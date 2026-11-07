@@ -120,6 +120,58 @@ class ArpBlocker:
         with self._lock:
             return normalize(mac) in self._targets
 
+    def health(self) -> dict:
+        """Snapshot for the UI: is the poison thread alive, any error yet?"""
+        with self._lock:
+            return {
+                "running": self.running,
+                "targets": len(self._targets),
+                "last_error": self._last_error,
+            }
+
+    def clear_error(self) -> None:
+        with self._lock:
+            self._last_error = ""
+
+    def refresh(self, iface: netinfo.Interface, gateway_mac: str) -> bool:
+        """Adopt a freshly resolved interface/gateway without restarting.
+
+        Called by the app when it re-resolves the network (Fix 1). The old
+        implementation cached gateway IP/MAC, local MAC and the Npcap device
+        name forever at add() time, so a Wi-Fi change or gateway ARP miss
+        silently broke an 'active' block. Returns True when anything changed
+        (the open socket is closed so the next send rebuilds it on the new
+        adapter).
+        """
+        if iface is None or not iface.gateway:
+            return False
+        new_gw_mac = normalize(gateway_mac) if gateway_mac else self._gateway_mac
+        new_local = normalize(iface.mac or "") or self._local_mac
+        new_iface_name = self._resolve_iface(iface.gateway, iface.ip)
+        with self._lock:
+            changed = (
+                self._gateway_ip != iface.gateway
+                or (new_gw_mac and self._gateway_mac != new_gw_mac)
+                or (new_local and self._local_mac != new_local)
+                or (new_iface_name and self._iface_name != new_iface_name)
+            )
+            if not changed:
+                return False
+            self._gateway_ip = iface.gateway
+            if new_gw_mac:
+                self._gateway_mac = new_gw_mac
+            if new_local:
+                self._local_mac = new_local
+            if new_iface_name:
+                self._iface_name = new_iface_name
+            self._events.append(
+                "Network refreshed: ARP blocker now uses gateway "
+                f"{iface.gateway} ({self._gateway_mac or 'MAC unknown'}) "
+                f"on {self._iface_name or iface.name}."
+            )
+        self._close_socket()
+        return True
+
     # -- lifecycle --------------------------------------------------------
     def add(self, mac: str, ip: str, iface: netinfo.Interface, gateway_mac: str) -> tuple[bool, str]:
         mac = normalize(mac)
@@ -198,29 +250,36 @@ class ArpBlocker:
 
     def _loop(self) -> None:
         while not self._stop.is_set():
-            with self._lock:
-                targets = list(self._targets.values())
-                gateway_ip = self._gateway_ip
-                gateway_mac = self._gateway_mac
-                local_mac = self._local_mac
-                iface_name = self._iface_name
-            if not targets or not gateway_ip:
-                break
+            try:
+                with self._lock:
+                    targets = list(self._targets.values())
+                    gateway_ip = self._gateway_ip
+                    gateway_mac = self._gateway_mac
+                    local_mac = self._local_mac
+                    iface_name = self._iface_name
+                if not targets or not gateway_ip:
+                    break
 
-            # Safety: if an address was handed to a different device, stop
-            # poisoning it so the new owner is not blocked by accident.
-            self._cycle += 1
-            if self._cycle % 8 == 0:
-                self._revalidate(targets)
+                # Safety: if an address was handed to a different device, stop
+                # poisoning it so the new owner is not blocked by accident.
+                self._cycle += 1
+                if self._cycle % 8 == 0:
+                    self._revalidate(targets)
 
-            with self._lock:
-                targets = list(self._targets.values())
+                with self._lock:
+                    targets = list(self._targets.values())
 
-            for target in targets:
-                try:
-                    self._poison(target, gateway_ip, gateway_mac, local_mac, iface_name)
-                except Exception as exc:  # keep other targets alive
-                    self._last_error = str(exc)
+                for target in targets:
+                    try:
+                        self._poison(target, gateway_ip, gateway_mac, local_mac, iface_name)
+                    except Exception as exc:  # keep other targets alive
+                        self._last_error = str(exc)
+                        if self._last_error not in self._events:
+                            self._events.append(f"ARP send error: {exc}")
+            except Exception as exc:  # never let the thread die silently
+                self._last_error = str(exc)
+                self._events.append(f"ARP blocker error: {exc}")
+                # wait instead of spinning if something keeps failing
             self._stop.wait(INTERVAL)
 
     def _revalidate(self, targets: list[dict]) -> None:

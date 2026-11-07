@@ -61,12 +61,20 @@ def main() -> int:
         app.connect_router(server.url, "excitel", "admin@123", None)
         check("gui connect", wait_for(app, lambda: app.router_state == "connected", 6), app.router_state)
 
-        app.start_scan(True)
-        check("gui scan finishes", wait_for(app, lambda: not app.scanning, 12))
-        pump(app, 0.5)
-
+        # The startup scan (from _first_run) may still be running when we
+        # connect and start_scan() then no-ops. Retry until a scan that ran
+        # *after* connect lists the mock device (pre-existing race, exposed
+        # when the live LAN fingerprint probes are slow).
         target = "16:4F:BD:EE:9C:3C"
-        check("mock device listed", target in app.rows, str(list(app.rows))[:200])
+        listed = False
+        for _attempt in range(4):
+            app.start_scan(True)
+            check("gui scan finishes", wait_for(app, lambda: not app.scanning, 15))
+            pump(app, 0.5)
+            if target in app.rows:
+                listed = True
+                break
+        check("mock device listed", listed, str(list(app.rows))[:200])
 
         app.tree.selection_set(target)
         app._act_block(False)

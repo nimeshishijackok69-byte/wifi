@@ -204,6 +204,11 @@ class NetGuardApp(tk.Tk):
         self.scanning = False
         self.last_scan: float = 0.0
         self.queue: queue.Queue = queue.Queue()
+        # Fix 1: track what ARP health we last reported, so we log each new
+        # failure exactly once instead of spamming every scan.
+        self._last_arp_error: str = ""
+        self._last_arp_running: bool | None = None
+        self._last_net_refresh: float = 0.0
 
         self._build_style()
         self._build_ui()
@@ -424,14 +429,63 @@ class NetGuardApp(tk.Tk):
             pass
         self.after(120, self._drain_queue)
 
-    def _refresh_network_info(self) -> None:
+    def _refresh_network_info(self, force: bool = False) -> None:
+        """Re-resolve the active interface and the gateway MAC (Fix 1).
+
+        Previously this ran once at startup, so a Wi-Fi change or an empty
+        ARP cache at launch broke Force offline / router detection for the
+        whole session. Now it re-checks at most every 45 s (and immediately
+        whenever the gateway MAC is still unknown), updates the ARP blocker
+        in place, and logs any change.
+        """
+        now = time.time()
+        last = getattr(self, "_last_net_refresh", 0.0)
+        need_resolve = force or (now - last >= 45) or not self.gateway_mac
+        if need_resolve:
+            self._last_net_refresh = now
+            old = self.iface
+            try:
+                new_iface = netinfo.active_interface()
+            except Exception:
+                new_iface = None
+            if new_iface is not None:
+                same = (
+                    old is not None
+                    and new_iface.ip == old.ip
+                    and new_iface.gateway == old.gateway
+                    and normalize(new_iface.mac or "") == normalize(old.mac or "")
+                )
+                if not same:
+                    if old is not None:
+                        self.log_line(
+                            f"Network changed: {old.ip} (gw {old.gateway or '—'}) -> "
+                            f"{new_iface.ip} (gw {new_iface.gateway or '—'})."
+                        )
+                    self.iface = new_iface
+                    self.my_mac = normalize(new_iface.mac) if new_iface.mac else ""
+            # Gateway MAC comes from the ARP cache, which a scan populates —
+            # always retry it while unknown instead of waiting 45 s.
+            if self.iface and self.iface.gateway:
+                fresh = netinfo.gateway_mac(self.iface.gateway)
+                if fresh and normalize(fresh) != self.gateway_mac:
+                    self.log_line(f"Gateway MAC resolved: {normalize(fresh)} ({self.iface.gateway}).")
+                    self.gateway_mac = normalize(fresh)
+            # Keep any live ARP blocks pointed at the current network.
+            if self.arp.targets and self.iface:
+                if self.arp.refresh(self.iface, self.gateway_mac):
+                    for msg in self.arp.drain_events():
+                        self.log_line(msg)
+
         if not self.iface:
             self.subtitle.configure(text="No active network connection")
             self.net_badge.configure(text="OFFLINE", fg="#FCA5A5")
             return
         net = self.iface.network
+        gw = self.iface.gateway or "—"
+        if not self.gateway_mac and self.iface.gateway:
+            gw += " (MAC ?)"
         self.subtitle.configure(
-            text=f"{self.iface.name}  •  {self.iface.ip}  •  gateway {self.iface.gateway or '—'}  •  {net}"
+            text=f"{self.iface.name}  •  {self.iface.ip}  •  gateway {gw}  •  {net}"
         )
         self.net_badge.configure(text=f"LAN {net}", fg="#A7F3D0")
 
@@ -572,6 +626,10 @@ class NetGuardApp(tk.Tk):
         self.scanning = False
         self.scan_btn.state(["!disabled"])
         self.last_scan = time.time()
+        # The sweep just populated the ARP cache, so the gateway MAC that was
+        # missing at launch may be resolvable now — refresh before classifying
+        # the router / self rows below.
+        self._refresh_network_info()
 
         raw: dict[str, dict] = {}
         for mac, dev in found.items():
@@ -670,6 +728,7 @@ class NetGuardApp(tk.Tk):
         self.log_line(f"Scan complete: {online} online, {len(rows)} known." + (f" Router: {router_error}" if router_error else ""))
         for message in self.arp.drain_events():
             self.log_line(message)
+        self._check_arp_health()
         self._update_arp_indicator()
         for mac in new_macs:
             row = rows.get(mac)
@@ -934,12 +993,52 @@ class NetGuardApp(tk.Tk):
         self.render()
         self._update_arp_indicator()
 
+    def _check_arp_health(self) -> None:
+        """Surface poison-thread death / send errors (Fix 1).
+
+        Previously last_error was recorded but never shown, and the UI
+        counted the in-memory dict even if the thread was dead. Log each
+        new state once; recovery is logged too.
+        """
+        health = self.arp.health()
+        error = health["last_error"] or ""
+        running = health["running"]
+        if error and error != self._last_arp_error:
+            self.log_line(f"⚠ Force-offline error: {error}")
+            self.footer.configure(text=f"⚠ Force-offline failing: {error[:90]}")
+        if health["targets"] and not running:
+            if self._last_arp_running is not False:
+                self.log_line(
+                    "⚠ ARP blocker thread stopped but "
+                    f"{health['targets']} device(s) are still marked forced offline — "
+                    "they may be back online. Restore and re-add to recover."
+                )
+        elif running and self._last_arp_running is False:
+            self.log_line("ARP blocker thread recovered.")
+        self._last_arp_error = error
+        self._last_arp_running = running
+
     def _update_arp_indicator(self) -> None:
         try:
-            targets = self.arp.targets
-            if targets:
-                count = len(targets)
-                self.arp_label.configure(text=f"{count} device{'s' if count != 1 else ''} forced offline")
+            health = self.arp.health()
+            count = health["targets"]
+            if count:
+                dead = not health["running"]
+                if dead:
+                    self.arp_label.configure(
+                        text=f"⚠ Blocker stopped — {count} device{'s' if count != 1 else ''} may be online",
+                        bg="#FEE2E2", fg="#991B1B",
+                    )
+                elif health["last_error"]:
+                    self.arp_label.configure(
+                        text=f"{count} forced offline ⚠ check log",
+                        bg="#FEF3C7", fg="#92400E",
+                    )
+                else:
+                    self.arp_label.configure(
+                        text=f"{count} device{'s' if count != 1 else ''} forced offline",
+                        bg="#FFEDD5", fg="#9A3412",
+                    )
                 if not self.arp_indicator.winfo_ismapped():
                     self.arp_indicator.pack(side="left", padx=(8, 0))
             else:
@@ -1133,6 +1232,12 @@ class NetGuardApp(tk.Tk):
 
     # -- persistence helpers ---------------------------------------------
     def _tick(self) -> None:
+        try:
+            self._refresh_network_info()
+            self._check_arp_health()
+            self._update_arp_indicator()
+        except Exception:
+            pass
         try:
             if self.auto_var.get() and not self.scanning and self.iface:
                 self.start_scan(False)
