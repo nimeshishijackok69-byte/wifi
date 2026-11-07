@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+oui.csv
+netguard/oui.csv
+*.tmp
+config.json
+devices.json
+# local NetGuard data lives in %APPDATA%\NetGuard - never commit real machine data
