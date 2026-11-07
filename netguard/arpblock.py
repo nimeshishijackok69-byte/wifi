@@ -312,7 +312,7 @@ class ArpBlocker:
         return failed
 
     # -- internals --------------------------------------------------------
-    def _resolve_iface(self, ip: str) -> str | None:
+    def _resolve_iface(self, ip: str, local_ip: str = "") -> str | None:
         """Map the local IPv4 address to the Npcap device scapy can send on."""
         try:
             from scapy.all import conf as scapy_conf
@@ -322,9 +322,10 @@ class ArpBlocker:
                 return scapy_conf.route.route(ip)[0]
             except Exception:
                 pass
+            target_ip = local_ip or ip
             for name, iface in scapy_conf.ifaces.items():
                 ips = getattr(iface, "ips", {}) or {}
-                if ip in ips.values():
+                if target_ip in ips.values():
                     return name
         except Exception:
             pass

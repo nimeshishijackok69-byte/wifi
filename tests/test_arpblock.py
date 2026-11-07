@@ -199,6 +199,27 @@ def main() -> int:
     check("restore failure event", any("Restore packets failed" in e for e in b4.drain_events()))
     b4.stop()
 
+    # Regression: _resolve_iface must accept (dest_ip, local_ip) — refresh()
+    # calls it with two args. The old test masked this with lambda *a.
+    import inspect as _inspect
+    params = list(_inspect.signature(arpblock.ArpBlocker._resolve_iface).parameters)
+    check("_resolve_iface signature", len(params) >= 3, str(params))
+    b5 = arpblock.ArpBlocker()
+    try:
+        result = b5._resolve_iface("192.168.1.1", "192.168.1.36")
+        check("_resolve_iface 2-arg call", result is None or isinstance(result, str), str(result))
+    except TypeError as exc:
+        check("_resolve_iface 2-arg call", False, str(exc))
+    # refresh() end-to-end with the REAL _resolve_iface (no *a mock)
+    b5._gateway_ip, b5._gateway_mac, b5._local_mac, b5._iface_name = "192.168.1.1", gateway, me, "OLD"
+    b5._targets["E2:93:95:08:18:57"] = {"mac": "E2:93:95:08:18:57", "ip": "192.168.1.33"}
+    try:
+        b5.refresh(iface, gateway)
+        check("refresh with targets does not raise", True)
+    except TypeError as exc:
+        check("refresh with targets does not raise", False, str(exc))
+    b5.stop()
+
     print()
     print("FAILED: " + ", ".join(FAILS) if FAILS else "ALL ARP TESTS PASSED")
     return 1 if FAILS else 0

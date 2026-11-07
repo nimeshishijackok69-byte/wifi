@@ -1004,9 +1004,11 @@ class NetGuardApp(tk.Tk):
         def work():
             try:
                 ok, msg = self.router.set_block(row.mac, not unblock)
-                # Fix 3: one relogin + retry if the session went stale
-                # between the last scan and this click.
-                if not ok and "logged in" in msg.lower():
+                # Fix 3 (repaired): one relogin + retry if the session went
+                # stale. A dead session surfaces as a login-page redirect
+                # ("No MAC address field…", 403, …), not the literal words
+                # "logged in" — match the session indicators too.
+                if not ok and any(k in msg.lower() for k in ("logged in", "filter page", "session", "http 40", "login.asp", "not logged")):
                     try:
                         self.router.relogin()
                         ok, msg = self.router.set_block(row.mac, not unblock)
