@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from mock_router import MockRouter  # noqa: E402
-from netguard.router import HuaweiRouter, LoginError  # noqa: E402
+from netguard.router import HuaweiRouter, LoginError, RouterError  # noqa: E402
 
 FAILS = []
 
@@ -52,6 +52,36 @@ def main() -> int:
         ok, msg = router.set_block(target, False)
         check("unblock", ok, msg)
         check("unblocked list", target not in router.blocked_macs(), str(router.blocked_macs()))
+
+        # Fix 3: relogin re-establishes the session with remembered creds.
+        version = router.relogin()
+        check("relogin", bool(version) and router.logged_in, version)
+        check("blocked readable after relogin", router.blocked_macs() == set())
+
+        # Fix 3: blocked_macs raises instead of silently returning set().
+        orig = router._filter_page_html
+        router._filter_page_html = lambda: (_ for _ in ()).throw(RouterError("link down"))
+        try:
+            router.blocked_macs()
+            check("blocked_macs raises on failure", False)
+        except RouterError:
+            check("blocked_macs raises on failure", True)
+        router._filter_page_html = orig
+
+        # Fix 3: an unverifiable change is a FAILURE, not "applied".
+        calls = {"n": 0}
+        def flaky():
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                raise RouterError("link down")
+            return orig()
+        router._filter_page_html = flaky
+        ok2, msg2 = router.set_block(target, True)
+        router._filter_page_html = orig
+        check("unverifiable is a failure", not ok2 and "verify" in msg2.lower(), msg2)
+        # The (unverified) add really landed on the mock; clean up.
+        check("unverified add did land", target in router.blocked_macs())
+        router.set_block(target, False)
     finally:
         server.stop()
 

@@ -271,10 +271,16 @@ class HuaweiRouter(BaseRouter):
         self._filter_page = ""
         self._filter_mode = ""
         self._crawled = False
+        # Credentials are kept in memory only so a dropped session can be
+        # re-established without asking the user again (Fix 3).
+        self._user = ""
+        self._password = ""
 
     # -- login ------------------------------------------------------------
     def login(self, username: str, password: str) -> str:
         self.logged_in = False
+        self._user = username
+        self._password = password
         html = self.get("/admin/login.asp")
         token = ""
         m = re.search(r"name=['\"]csrftoken['\"]\s+value=['\"]([^'\"]+)", html)
@@ -305,6 +311,22 @@ class HuaweiRouter(BaseRouter):
         self.logged_in = True
         self._read_identity()
         return self.model or self.version or "logged in"
+
+    def relogin(self) -> str:
+        """Re-establish a dropped session with the remembered credentials.
+
+        The app calls this once when a router read fails mid-session (Fix 3)
+        instead of failing every scan forever on a dead cookie.
+        """
+        if not self._user or not self._password:
+            raise RouterError("Router session expired and no credentials are remembered.")
+        # Force a fresh crawl so cached pages from the dead session are not
+        # served as if they were current.
+        self._crawled = False
+        self._pages = {}
+        self._client_page = ""
+        self._filter_page = ""
+        return self.login(self._user, self._password)
 
     def _read_identity(self) -> None:
         for path in ("/html/ssmp/deviceinfo/deviceinfo.asp", "/html/ssmp/index.asp"):
@@ -475,13 +497,17 @@ class HuaweiRouter(BaseRouter):
         return self.get(self._filter_page)
 
     def blocked_macs(self) -> set[str]:
-        if not self.logged_in or not self._filter_page:
+        """MACs currently in the router filter.
+
+        Fix 3: a read failure now raises instead of returning an empty set.
+        Returning set() made the UI show *everyone* as unblocked while the
+        router still blocked them. Callers that want the last-known state
+        (the app) pass an explicit fallback.
+        """
+        if not self.logged_in:
             return set()
         macs: set[str] = set()
-        try:
-            html = self._filter_page_html()
-        except RouterError:
-            return set()
+        html = self._filter_page_html()  # raises RouterError on failure
         for table in parse_page(html).tables:
             for row in table:
                 for cell in row:
@@ -506,16 +532,26 @@ class HuaweiRouter(BaseRouter):
         if not ok:
             return False, msg
 
-        # Verify by re-reading the filter page.
-        try:
-            after = set()
-            for table in parse_page(self._filter_page_html()).tables:
-                for row in table:
-                    for cell in row:
-                        for m in MAC_RE.finditer(cell):
-                            after.add(norm_mac(m.group(1)))
-        except RouterError:
-            return True, "Applied (could not verify)"
+        # Verify by re-reading the filter page. Fix 3: a read failure is a
+        # failure, not a success — previously this returned
+        # "Applied (could not verify)" which the UI showed as blocked.
+        after: set[str] | None = None
+        for _attempt in range(2):
+            try:
+                after = set()
+                for table in parse_page(self._filter_page_html()).tables:
+                    for row in table:
+                        for cell in row:
+                            for m in MAC_RE.finditer(cell):
+                                after.add(norm_mac(m.group(1)))
+                break
+            except RouterError:
+                after = None
+        if after is None:
+            return False, (
+                "Sent the change but could not verify it on the router. "
+                "Treating it as NOT applied — check Router diagnostics, then retry."
+            )
 
         present = mac in after
         if present == blocked:

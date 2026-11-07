@@ -597,14 +597,36 @@ class NetGuardApp(tk.Tk):
         router_clients: dict[str, dict] = {}
         blocked: set[str] = set()
         router_error = ""
+        router_ok = True
+        router_note = ""
         if self.router and self.router.logged_in:
-            try:
-                for c in self.router.clients():
-                    mac = normalize(c["mac"])
-                    router_clients[mac] = c
-                blocked = {normalize(m) for m in self.router.blocked_macs()}
-            except Exception as exc:
-                router_error = str(exc)
+            # Fix 3: a dropped session now gets exactly one relogin + retry,
+            # and a still-failing read is passed as router_ok=False so the
+            # UI keeps showing the last-known blocked state (instead of
+            # flipping everyone to unblocked).
+            for attempt in range(2):
+                try:
+                    router_clients = {}
+                    for c in self.router.clients():
+                        mac = normalize(c["mac"])
+                        router_clients[mac] = c
+                    blocked = {normalize(m) for m in self.router.blocked_macs()}
+                    router_ok = True
+                    router_error = ""
+                    break
+                except Exception as exc:
+                    router_error = str(exc)
+                    router_clients = {}
+                    blocked = set()
+                    router_ok = False
+                    if attempt == 0:
+                        try:
+                            self.router.relogin()
+                            router_note = f"Router session re-established after: {exc}"
+                            continue
+                        except Exception as relog_exc:
+                            router_error = f"{exc} (relogin failed: {relog_exc})"
+                            break
 
         # Best-effort device identification so randomised MACs are not all
         # just “Unknown”.  This only probes each device it already found.
@@ -619,9 +641,9 @@ class NetGuardApp(tk.Tk):
         except Exception:
             fingerprints = {}
 
-        self.post(lambda: self._scan_done(found, router_clients, blocked, router_error, started, fingerprints))
+        self.post(lambda: self._scan_done(found, router_clients, blocked, router_error, started, fingerprints, router_ok, router_note))
 
-    def _scan_done(self, found: dict, router_clients: dict, blocked: set, router_error: str = "", started: float = 0, fingerprints: dict | None = None) -> None:
+    def _scan_done(self, found: dict, router_clients: dict, blocked: set, router_error: str = "", started: float = 0, fingerprints: dict | None = None, router_ok: bool = True, router_note: str = "") -> None:
         fingerprints = fingerprints or {}
         self.scanning = False
         self.scan_btn.state(["!disabled"])
@@ -671,7 +693,7 @@ class NetGuardApp(tk.Tk):
                 randomized=bool((live or {}).get("randomized", rec.get("randomized", False))),
                 connection=(live or {}).get("connection", ""),
                 online=bool(live),
-                blocked=(mac in blocked) if self.router_state == "connected" else bool(rec.get("blocked")),
+                blocked=(mac in blocked) if (router_ok and self.router_state == "connected") else bool(rec.get("blocked")),
                 arp_blocked=self.arp.is_blocking(mac),
                 protected=bool(rec.get("protected", False)),
                 first_seen=rec.get("first_seen", 0),
@@ -720,10 +742,12 @@ class NetGuardApp(tk.Tk):
             me.ip = me.ip or (self.iface.ip if self.iface else "")
             me.name = me.name or "This computer"
 
-        # Remember the authoritative blocked state from the router.
+        # Remember the authoritative blocked state from the router — only
+        # when the read actually succeeded (Fix 3). A failed read must not
+        # overwrite last-known blocked state with "unblocked".
         for mac, row in rows.items():
             rec = self.store.record(mac)
-            if blocked or self.router_state == "connected":
+            if router_ok and self.router_state == "connected":
                 rec["blocked"] = row.blocked
         self.store.save_devices()
 
@@ -733,6 +757,16 @@ class NetGuardApp(tk.Tk):
         online = sum(1 for r in rows.values() if r.online)
         self.footer.configure(text=f"{online} device{'s' if online != 1 else ''} online  •  scan took {elapsed:.1f}s  •  {ago(self.last_scan)}")
         self.log_line(f"Scan complete: {online} online, {len(rows)} known." + (f" Router: {router_error}" if router_error else ""))
+        if router_note:
+            self.log_line(f"✓ {router_note}")
+        if not router_ok and router_error:
+            # Session is dead even after one relogin: drop to the error
+            # badge so the banner offers Router login again, but keep
+            # showing last-known blocked state above.
+            if self.router_state == "connected":
+                self.router_state = "error"
+                self._update_router_badge()
+            self.log_line("⚠ Router read failed — showing last-known blocked state. Use Router login to reconnect.")
         for message in self.arp.drain_events():
             self.log_line(message)
         self._check_arp_health()
@@ -896,6 +930,14 @@ class NetGuardApp(tk.Tk):
         def work():
             try:
                 ok, msg = self.router.set_block(row.mac, not unblock)
+                # Fix 3: one relogin + retry if the session went stale
+                # between the last scan and this click.
+                if not ok and "logged in" in msg.lower():
+                    try:
+                        self.router.relogin()
+                        ok, msg = self.router.set_block(row.mac, not unblock)
+                    except Exception as relog_exc:
+                        msg = f"{msg} (relogin failed: {relog_exc})"
                 self.post(lambda: self._block_done(row.mac, ok, msg, unblock))
             except Exception as exc:
                 message = str(exc)
