@@ -7,10 +7,14 @@ reintroduces it fails here instead of on a live network.
 from __future__ import annotations
 
 import ctypes
+import ipaddress
 import os
+import ssl
 import sys
 import tempfile
 import threading
+import types
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 temp = tempfile.mkdtemp(prefix="netguard-regress-")
@@ -24,7 +28,7 @@ from mock_router import MockRouter  # noqa: E402
 
 import netguard.app as appmod  # noqa: E402
 import netguard.fingerprint as fingerprint  # noqa: E402
-from netguard import arpblock, netinfo  # noqa: E402
+from netguard import arpblock, netinfo, scanner  # noqa: E402
 from netguard.router import (  # noqa: E402
     HuaweiRouter,
     RouterError,
@@ -68,6 +72,156 @@ def test_session_expiry() -> None:
         check("expiry: block survives relogin", target in router.blocked_macs(), str(router.blocked_macs()))
     finally:
         server.stop()
+
+
+def test_account_page_is_not_login_expiry() -> None:
+    server = MockRouter().start()
+    try:
+        router = HuaweiRouter(server.url, timeout=5)
+        router.login("excitel", "admin@123")
+        page = router.get("/html/ssmp/account/account.asp")
+        check("account page with psd is content", "formPwdChange" in page)
+        clients = router.clients()
+        check("account page does not expire session", router.logged_in and bool(clients))
+        check("account page does not corrupt blocked read", router.blocked_macs() == set())
+    except SessionExpired as exc:
+        check("account page does not expire session", False, str(exc))
+    finally:
+        server.stop()
+
+
+def test_tls_verifies_certificates() -> None:
+    router = HuaweiRouter("https://192.168.1.1", timeout=5)
+    ctx = None
+    for handler in router.opener.handlers:
+        if isinstance(handler, urllib.request.HTTPSHandler):
+            ctx = handler._context
+    check(
+        "router TLS verifies certificates and hostname",
+        ctx is not None and ctx.check_hostname and ctx.verify_mode == ssl.CERT_REQUIRED,
+        f"check_hostname={getattr(ctx, 'check_hostname', None)} verify_mode={getattr(ctx, 'verify_mode', None)}",
+    )
+
+
+def test_subnet_sweep_cap_bounds_enumeration() -> None:
+    class FakeNetwork:
+        def __init__(self, size):
+            self.size = size
+            self.yielded = 0
+
+        def hosts(self):
+            for i in range(1, self.size + 1):
+                self.yielded += 1
+                yield ipaddress.ip_address(f"10.0.{i >> 8}.{i & 255}")
+
+    fake_network = FakeNetwork(200_000)
+    fake_iface = types.SimpleNamespace(ip="10.0.0.1", network=fake_network)
+    probed: list[str] = []
+    real_udp_probe = scanner._udp_probe
+    scanner._udp_probe = lambda ip: probed.append(ip)
+    real_arp_table = netinfo.arp_table
+    netinfo.arp_table = lambda: {}
+    try:
+        scanner.arp_sweep(fake_iface)
+    finally:
+        scanner._udp_probe = real_udp_probe
+        netinfo.arp_table = real_arp_table
+    check(
+        "subnet cap bounds enumeration",
+        len(probed) == 1024 and fake_network.yielded < 2000,
+        f"probed={len(probed)} yielded={fake_network.yielded}",
+    )
+
+
+def test_remove_sends_restore_after_poison() -> None:
+    mac = "16:4F:BD:EE:9C:3C"
+    blocker = arpblock.ArpBlocker()
+    blocker._targets[mac] = {"mac": mac, "ip": "192.168.1.33"}
+    blocker._gateway_ip = "192.168.1.1"
+    blocker._gateway_mac = "AA:AA:AA:AA:AA:AA"
+    blocker._local_mac = "11:11:11:11:11:11"
+    blocker._local_ip = "192.168.1.36"
+
+    entered = threading.Event()
+    release = threading.Event()
+    events: list[tuple[str, str]] = []
+
+    def gated_poison(target, gateway_ip, gateway_mac, local_mac, iface_name):
+        entered.set()
+        release.wait(5)
+        events.append(("poison", target["mac"]))
+        blocker._stop.set()
+
+    def restore_one(target):
+        events.append(("restore", target["mac"]))
+        return True
+
+    blocker._poison = gated_poison
+    blocker._restore_one = restore_one
+
+    thread = threading.Thread(target=blocker._loop, daemon=True)
+    thread.start()
+    if not entered.wait(3):
+        thread.join(0.5)
+        check("loop reaches poison before remove", False)
+        return
+
+    removed: list[bool] = []
+    remove_thread = threading.Thread(target=lambda: removed.append(blocker.remove(mac)), daemon=True)
+    remove_thread.start()
+    threading.Event().wait(0.05)  # let remove() wait on the loop-level lock
+    release.set()
+    removed_thread_join = remove_thread.join(3)
+    thread.join(3)
+    check(
+        "restore is not followed by poison",
+        removed == [True] and events == [("poison", mac), ("restore", mac)] and not thread.is_alive(),
+        f"removed={removed} events={events}",
+    )
+
+
+def test_gateway_identity_cleared_and_row_protected() -> None:
+    old_iface = netinfo.Interface("Wi-Fi", "192.168.1.36", "255.255.255.0", "192.168.1.1", "11:11:11:11:11:11", "Wi-Fi")
+    new_iface = netinfo.Interface("Wi-Fi", "10.0.0.36", "255.255.255.0", "10.0.0.1", "22:22:22:22:22:22", "Wi-Fi")
+    real_first_run = appmod.NetGuardApp._first_run
+    real_start_scan = appmod.NetGuardApp.start_scan
+    real_active = appmod.netinfo.active_interface
+    real_gateway_mac = appmod.netinfo.gateway_mac
+    appmod.NetGuardApp._first_run = lambda self: None
+    appmod.NetGuardApp.start_scan = lambda self, manual=False: None
+    appmod.netinfo.active_interface = lambda prefer=None, text=None: new_iface
+    appmod.netinfo.gateway_mac = lambda gateway: ""
+
+    app = appmod.NetGuardApp()
+    app.withdraw()
+    try:
+        app.iface = old_iface
+        app.my_mac = "11:11:11:11:11:11"
+        app.gateway_mac = "AA:AA:AA:AA:AA:AA"
+        app._last_net_refresh = 0.0
+        app._refresh_network_info()
+        check("new network clears stale gateway MAC", app.gateway_mac == "", repr(app.gateway_mac))
+
+        app.router_state = "connected"
+        gateway_mac = "BB:BB:BB:BB:BB:BB"
+        app._scan_done(
+            {},
+            {gateway_mac: {"mac": gateway_mac, "ip": "10.0.0.1", "hostname": "Router", "connection": ""}},
+            set(),
+            "",
+            0.0,
+            {},
+            True,
+            "",
+        )
+        row = app.rows.get(gateway_mac)
+        check("real gateway protected by its IP", row is not None and row.is_router, str(row))
+    finally:
+        app.destroy()
+        appmod.NetGuardApp._first_run = real_first_run
+        appmod.NetGuardApp.start_scan = real_start_scan
+        appmod.netinfo.active_interface = real_active
+        appmod.netinfo.gateway_mac = real_gateway_mac
 
 
 def test_http_error_is_not_empty() -> None:
@@ -594,6 +748,11 @@ def test_scan_error_and_corrupt_store() -> None:
 
 def main() -> int:
     test_session_expiry()
+    test_account_page_is_not_login_expiry()
+    test_tls_verifies_certificates()
+    test_subnet_sweep_cap_bounds_enumeration()
+    test_remove_sends_restore_after_poison()
+    test_gateway_identity_cleared_and_row_protected()
     test_http_error_is_not_empty()
     test_filter_mode_options()
     test_filter_mac_extraction()

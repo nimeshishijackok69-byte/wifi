@@ -109,6 +109,24 @@ def main() -> int:
         app.tree.selection_set(target)
         app._act_block(True)
         check("gui unblock", wait_for(app, lambda: Store().record(target).get("blocked") is False, 8))
+
+        # Fix 12: the dialog must construct, and a failed login must not
+        # overwrite the last known-good saved password.
+        seed = Store()
+        seed.config["router_url"] = server.url
+        seed.config["username"] = "excitel"
+        seed.config["remember_password"] = True
+        seed.password = "admin@123"
+        seed.save_config()
+        app.store.load()
+        dialog = appmod.SettingsDialog(app)
+        check("settings dialog constructs", dialog is not None)
+        dialog.pwd.delete(0, "end")
+        dialog.pwd.insert(0, "admin@124")
+        dialog.save_and_test()
+        failed = wait_for(app, lambda: app.router_state == "failed", 10)
+        check("failed login keeps good stored password", failed and Store().password == "admin@123")
+        dialog.destroy()
     finally:
         app.destroy()
         server.stop()

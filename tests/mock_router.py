@@ -28,7 +28,17 @@ FRAME = """<html><frameset>
 MENU = """<html><body>
 <a href="/html/ssmp/dhcpinfo/dhcpinfo.asp">DHCP Information</a>
 <a href="/html/ssmp/macfilter/macfilter.asp">MAC Filter</a>
+<a href="/html/ssmp/account/account.asp">Account</a>
 </body></html>"""
+
+ACCOUNT = """<html><body>
+<h4>Change password</h4>
+<form action="/boaform/admin/formPwdChange" method="POST">
+<input type="password" name="oldpsd" value="">
+<input type="password" name="psd" value="">
+<input type="password" name="psd1" value="">
+<input type="submit" name="btnApply" value="Apply">
+</form></body></html>"""
 
 DHCP = """<html><body><h2>DHCP Information</h2>
 <table border=1>
@@ -112,6 +122,8 @@ class Handler(BaseHTTPRequestHandler):
                 for i, (h, ip, mac, iface) in enumerate(s.clients, 1)
             )
             return self._send(DHCP.format(rows=rows))
+        if path == "/html/ssmp/account/account.asp":
+            return self._send(ACCOUNT)
         if path == "/html/ssmp/macfilter/macfilter.asp":
             blocked = "".join(f"<tr><td>{m}</td></tr>" for m in sorted(s.blocked))
             checks = "".join(

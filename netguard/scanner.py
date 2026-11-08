@@ -68,9 +68,16 @@ def _tcp_probe(ip: str) -> None:
 def arp_sweep(iface: netinfo.Interface, deep: bool = False) -> dict[str, str]:
     """Populate and read the ARP table. Returns IP -> MAC."""
     net = iface.network
-    hosts = [str(h) for h in net.hosts() if str(h) != iface.ip]
-    if len(hosts) > 1024:
-        hosts = hosts[:1024]
+    hosts: list[str] = []
+    for host in net.hosts():
+        address = str(host)
+        if address == iface.ip:
+            continue
+        hosts.append(address)
+        # Stop while enumerating: the 1024 cap must bound the work and the
+        # memory, not just trim the finished list.
+        if len(hosts) >= 1024:
+            break
 
     with ThreadPoolExecutor(max_workers=64) as pool:
         list(pool.map(_udp_probe, hosts))

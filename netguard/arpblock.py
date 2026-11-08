@@ -148,13 +148,18 @@ class ArpBlocker:
         """
         if iface is None or not iface.gateway:
             return False
-        new_gw_mac = normalize(gateway_mac) if gateway_mac else self._gateway_mac
+        # An empty lookup only preserves the old MAC for the same gateway;
+        # it must never carry the old router identity onto a new gateway.
+        if gateway_mac:
+            new_gw_mac = normalize(gateway_mac)
+        else:
+            new_gw_mac = self._gateway_mac if iface.gateway == self._gateway_ip else ""
         new_local = normalize(iface.mac or "") or self._local_mac
         new_iface_name = self._resolve_iface(iface.gateway, iface.ip)
         with self._lock:
             changed = (
                 self._gateway_ip != iface.gateway
-                or (new_gw_mac and self._gateway_mac != new_gw_mac)
+                or (new_gw_mac != self._gateway_mac)
                 or (new_local and self._local_mac != new_local)
                 or (new_iface_name and self._iface_name != new_iface_name)
                 or (iface.ip and self._local_ip != iface.ip)
@@ -166,6 +171,8 @@ class ArpBlocker:
                 self._local_ip = iface.ip
             if new_gw_mac:
                 self._gateway_mac = new_gw_mac
+            elif not gateway_mac:
+                self._gateway_mac = ""
             if new_local:
                 self._local_mac = new_local
             if new_iface_name:
@@ -395,14 +402,22 @@ class ArpBlocker:
                     targets = list(self._targets.values())
 
                 cycle_ok = True
-                for target in targets:
-                    try:
-                        self._poison(target, gateway_ip, gateway_mac, local_mac, iface_name)
-                    except Exception as exc:  # keep other targets alive
-                        cycle_ok = False
-                        self._last_error = str(exc)
-                        if self._last_error not in self._events:
-                            self._events.append(f"ARP send error: {exc}")
+                # Keep the state lock across membership checks and the poison
+                # sends.  A remove() that wins the lock first removes the
+                # target and restores it; one that waits cannot report success
+                # before a stale poison is sent.  The send is only the two
+                # forged ARP replies, so holding the lock here is short-lived.
+                with self._lock:
+                    for target in targets:
+                        if target["mac"] not in self._targets:
+                            continue
+                        try:
+                            self._poison(target, gateway_ip, gateway_mac, local_mac, iface_name)
+                        except Exception as exc:  # keep other targets alive
+                            cycle_ok = False
+                            self._last_error = str(exc)
+                            if self._last_error not in self._events:
+                                self._events.append(f"ARP send error: {exc}")
                 # Recovery is a fact once a full cycle has been sent again;
                 # otherwise the badge stays "check log" forever.
                 if cycle_ok and self._last_error:

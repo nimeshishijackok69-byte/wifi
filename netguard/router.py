@@ -306,9 +306,10 @@ class BaseRouter:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.jar = http.cookiejar.CookieJar()
+        # Router credentials traverse this opener, so TLS must be authenticated.
+        # Keep SSL verification and hostname checking enabled rather than
+        # trusting arbitrary certificates on the local network.
         ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
         self.opener = urllib.request.build_opener(
             urllib.request.HTTPCookieProcessor(self.jar),
             urllib.request.HTTPSHandler(context=ctx),
@@ -348,16 +349,30 @@ class BaseRouter:
 
     @staticmethod
     def _looks_like_login(url: str, body: str) -> bool:
+        """Recognise a router login form without mistaking an account page.
+
+        The password-change page on Huawei Boa firmware also uses ``psd`` and
+        ``psd1`` fields, so a bare ``name="psd"`` is not evidence of a dead
+        session.  A login form is instead identified by its form-login
+        destination (or a username/password pair posted like the Boa login).
+        """
         if "login.asp" in (url or "").lower():
             return True
-        low = body.lower()
-        if "<form" not in low:
+        try:
+            page = parse_page(body or "")
+        except Exception:
             return False
-        return (
-            "name=\"psd\"" in low
-            or "name='psd'" in low
-            or "formlogin" in low
-        )
+        for form in page.forms:
+            action = (form.action or "").lower()
+            names = {str(inp.get("name", "")).lower() for inp in form.inputs}
+            has_login_target = "formlogin" in action or "login" in action
+            has_username = bool(names & {"username", "username1", "user", "userid"})
+            has_password = bool(names & {"psd", "psd1", "password", "passwd", "pwd"})
+            if has_login_target and has_password:
+                return True
+            if "csrftoken" in names and has_username and has_password:
+                return True
+        return False
 
     def _request(self, req, path: str) -> str:
         body, status, final_url = self._open(req, path)
@@ -533,7 +548,7 @@ class HuaweiRouter(BaseRouter):
             except RouterError:
                 continue
             low = html.lower()
-            if "admin/login.asp" in low or ("<form" in low and "name=\"psd\"" in low):
+            if "admin/login.asp" in low or self._looks_like_login(path, html):
                 continue
             seen[path] = html
             for link in parse_page(html).links:

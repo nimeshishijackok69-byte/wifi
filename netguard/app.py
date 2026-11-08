@@ -164,7 +164,6 @@ class SettingsDialog(tk.Toplevel):
         self.grab_set()
 
         cfg = app.store.config
-        pad = {"padx": 18, "pady": (0, 10)}
 
         tk.Label(self, text="Router admin login", font=(FONT, 15, "bold"), bg=BG, fg=INK).pack(anchor="w", padx=18, pady=(16, 2))
         tk.Label(
@@ -212,7 +211,7 @@ class SettingsDialog(tk.Toplevel):
         tk.Label(self, text=label, font=(FONT, 9, "bold"), bg=BG, fg=MUTED).pack(anchor="w", padx=18, pady=(0, 3))
         entry = tk.Entry(self, font=(FONT, 10), bg=CARD, fg=INK, relief="solid", bd=1, width=46, show=show)
         entry.insert(0, value)
-        entry.pack(fill="x", **pad)
+        entry.pack(fill="x", padx=18, pady=(0, 10))
         return entry
 
     def save_and_test(self) -> None:
@@ -225,18 +224,18 @@ class SettingsDialog(tk.Toplevel):
             self.status.configure(text="Enter both the username and the password.", fg=DANGER)
             return
 
-        self.app.store.config["router_url"] = url
-        self.app.store.config["username"] = user
-        self.app.store.config["remember_password"] = self.remember.get()
-        self.app.store.password = pwd
-        if self.app.store.password_is_plain:
-            # Fix 5: DPAPI failed — the password is on disk in clear text.
-            self.app.log_line("⚠ Router password could NOT be encrypted (DPAPI failed) and is stored in plain text in config.json.")
-        self.app.store.save_config()
+        # Form fields are not persisted until login succeeds (Fix 12); a typo
+        # must not overwrite the last known-good saved password.
+        pending = {
+            "url": url,
+            "username": user,
+            "password": pwd,
+            "remember_password": bool(self.remember.get()),
+        }
 
         self.status.configure(text="Connecting to the router…", fg=MUTED)
         self.test_btn.state(["disabled"])
-        self.app.connect_router(url, user, pwd, self)
+        self.app.connect_router(url, user, pwd, self, pending=pending)
 
 
 # --------------------------------------------------------------------------
@@ -536,13 +535,18 @@ class NetGuardApp(tk.Tk):
                         )
                     self.iface = new_iface
                     self.my_mac = normalize(new_iface.mac) if new_iface.mac else ""
+                    # The previous gateway MAC belongs to the old network; it
+                    # must not be reused until the new gateway is resolved.
+                    self.gateway_mac = ""
             # Gateway MAC comes from the ARP cache, which a scan populates —
             # always retry it while unknown instead of waiting 45 s.
             if self.iface and self.iface.gateway:
                 fresh = netinfo.gateway_mac(self.iface.gateway)
-                if fresh and normalize(fresh) != self.gateway_mac:
-                    self.log_line(f"Gateway MAC resolved: {normalize(fresh)} ({self.iface.gateway}).")
-                    self.gateway_mac = normalize(fresh)
+                if fresh:
+                    fresh_mac = normalize(fresh)
+                    if fresh_mac != self.gateway_mac:
+                        self.log_line(f"Gateway MAC resolved: {fresh_mac} ({self.iface.gateway}).")
+                    self.gateway_mac = fresh_mac
             # Keep any live ARP blocks pointed at the current network.
             if self.arp.targets and self.iface:
                 if self.arp.refresh(self.iface, self.gateway_mac):
@@ -665,7 +669,7 @@ class NetGuardApp(tk.Tk):
         self.start_scan(True)
 
     # -- router -----------------------------------------------------------
-    def connect_router(self, url: str, user: str, pwd: str, dialog: SettingsDialog | None) -> None:
+    def connect_router(self, url: str, user: str, pwd: str, dialog: SettingsDialog | None, pending: dict | None = None) -> None:
         self.router_state = "connecting"
         self._update_router_badge()
 
@@ -673,7 +677,7 @@ class NetGuardApp(tk.Tk):
             try:
                 router = HuaweiRouter(url, timeout=10)
                 version = router.login(user, pwd)
-                self.post(lambda: self._router_ok(router, version, dialog))
+                self.post(lambda: self._router_ok(router, version, dialog, pending))
             except LoginError as exc:
                 message = str(exc)
                 self.post(lambda m=message: self._router_fail(m, dialog, login=True))
@@ -683,9 +687,19 @@ class NetGuardApp(tk.Tk):
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _router_ok(self, router: HuaweiRouter, version: str, dialog: SettingsDialog | None) -> None:
+    def _router_ok(self, router: HuaweiRouter, version: str, dialog: SettingsDialog | None, pending: dict | None = None) -> None:
         self.router = router
         self.router_state = "connected"
+        if pending is not None:
+            # Only a successful login may replace the persisted credentials.
+            self.store.config["router_url"] = pending["url"]
+            self.store.config["username"] = pending["username"]
+            self.store.config["remember_password"] = pending.get("remember_password", True)
+            self.store.password = pending.get("password", "")
+            if self.store.password_is_plain:
+                # Fix 5: DPAPI failed — the password is on disk in clear text.
+                self.log_line("⚠ Router password could NOT be encrypted (DPAPI failed) and is stored in plain text in config.json.")
+            self.store.save_config()
         self._update_router_badge()
         self.log_line(f"Connected to {router.name} {('(' + version + ')') if version else ''}.")
         self.footer.configure(text="Router connected")
@@ -853,7 +867,8 @@ class NetGuardApp(tk.Tk):
                 scanner.Device(mac=mac, hostname=row.name, vendor=row.vendor)
             )
             row.is_me = bool(self.my_mac) and mac == self.my_mac
-            row.is_router = bool(self.gateway_mac) and mac == self.gateway_mac
+            gateway_ip = str(self.iface.gateway or "") if self.iface else ""
+            row.is_router = (bool(self.gateway_mac) and mac == self.gateway_mac) or bool(gateway_ip and row.ip == gateway_ip)
             if row.is_router:
                 row.kind = "router"
                 row.name = row.name or "Router"
@@ -871,6 +886,11 @@ class NetGuardApp(tk.Tk):
                           protected=bool(self.store.devices.get(mac, {}).get("protected", False)),
                           first_seen=now, last_seen=now)
                 row.kind = info.get("guess_category") or scanner.classify(scanner.Device(mac=mac, hostname=row.name, vendor=row.vendor))
+                gateway_ip = str(self.iface.gateway or "") if self.iface else ""
+                row.is_router = (bool(self.gateway_mac) and mac == self.gateway_mac) or bool(gateway_ip and row.ip == gateway_ip)
+                if row.is_router:
+                    row.kind = "router"
+                    row.name = row.name or "Router"
                 rows[mac] = row
 
         # This computer is not always present in the ARP cache; show it anyway.
