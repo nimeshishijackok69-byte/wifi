@@ -833,8 +833,12 @@ class NetGuardApp(tk.Tk):
                 self.arp.retarget(old_mac, new_mac, ip)
                 self.log_line(f"↻ Forced-offline carried to rotated MAC {new_mac} ({host}, {ip}).")
             if old_mac in blocked and self.router and self.router.logged_in:
-                self.log_line(f"↻ Router block carried to rotated MAC {new_mac} ({host}, {ip}).")
-                threading.Thread(target=self._reblock_rotated, args=(old_mac, new_mac), daemon=True).start()
+                # H3: same IP+hostname can be two identical-model phones.
+                # ARP carry is temporary/reversible, so it stays automatic;
+                # a router slot swap is permanent, so it must be confirmed
+                # by the user on the new row — never auto-applied.
+                self.log_line(f"⚠ Possible MAC rotation: blocked {old_mac} may now be {new_mac} ({host}, {ip}). Block the new row manually if it is the same device.")
+                self.footer.configure(text=f"Possible rotated device at {ip} — check and block manually if needed")
 
         self.store.merge_scan(raw)
         now = time.time()

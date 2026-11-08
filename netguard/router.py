@@ -736,12 +736,15 @@ class HuaweiRouter(BaseRouter):
             except RouterError:
                 pass
 
+        # M1: snapshot under the request lock so a concurrent relogin()
+        # reassigning _pages cannot mutate the dict mid-iteration.
+        with self._lock:
+            pages_snapshot = dict(self._pages)
+            filter_page = self._filter_page
+
         found: dict[str, dict] = {}
-        for path, html in self._pages.items():
-            # The MAC filter is a list of *blocked* addresses, not clients.
-            # Parsing it here used to invent online devices with ip="" and
-            # then wipe the stored IP in store.merge_scan().
-            if path == self._filter_page or any(h in path.lower() for h in FILTER_HINTS):
+        for path, html in pages_snapshot.items():
+            if path == filter_page or any(h in path.lower() for h in FILTER_HINTS):
                 continue
             page = parse_page(html)
             for table in page.tables:
