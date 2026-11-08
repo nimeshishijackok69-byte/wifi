@@ -880,7 +880,7 @@ class NetGuardApp(tk.Tk):
             row.kind = rec_category or scanner.classify(
                 scanner.Device(mac=mac, hostname=row.name, vendor=row.vendor)
             )
-            row.is_me = bool(self.my_mac) and mac == self.my_mac
+            row.is_me = (bool(self.my_mac) and mac == self.my_mac) or bool(self.iface and row.ip and row.ip == self.iface.ip)
             gateway_ip = str(self.iface.gateway or "") if self.iface else ""
             row.is_router = (bool(self.gateway_mac) and mac == self.gateway_mac) or bool(gateway_ip and row.ip == gateway_ip)
             if row.is_router:
@@ -900,6 +900,7 @@ class NetGuardApp(tk.Tk):
                           protected=bool(self.store.devices.get(mac, {}).get("protected", False)),
                           first_seen=now, last_seen=now)
                 row.kind = info.get("guess_category") or scanner.classify(scanner.Device(mac=mac, hostname=row.name, vendor=row.vendor))
+                row.is_me = bool(self.iface and row.ip and row.ip == self.iface.ip)
                 gateway_ip = str(self.iface.gateway or "") if self.iface else ""
                 row.is_router = (bool(self.gateway_mac) and mac == self.gateway_mac) or bool(gateway_ip and row.ip == gateway_ip)
                 if row.is_router:

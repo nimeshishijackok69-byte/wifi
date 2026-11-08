@@ -26,6 +26,15 @@ MAC_RE = re.compile(r"\b([0-9A-Fa-f]{2}(?:[:-][0-9A-Fa-f]{2}){5})\b")
 IPV4_RE = re.compile(r"\b((?:\d{1,3}\.){3}\d{1,3})\b")
 
 
+def valid_ipv4(ip: str) -> bool:
+    """True only for dotted quads with every octet in 0-255."""
+    try:
+        parts = str(ip).split(".")
+        return len(parts) == 4 and all(0 <= int(p) <= 255 for p in parts)
+    except Exception:
+        return False
+
+
 class RouterError(Exception):
     pass
 
@@ -762,7 +771,7 @@ class HuaweiRouter(BaseRouter):
                                 continue
                         if not ip:
                             m = IPV4_RE.search(text)
-                            if m and not m.group(1).startswith(("0.", "255.")):
+                            if m and valid_ipv4(m.group(1)) and not m.group(1).startswith(("0.", "255.")):
                                 ip = m.group(1)
                                 continue
                         if not name and text and len(text) < 64 and not IPV4_RE.fullmatch(text):
@@ -784,7 +793,7 @@ class HuaweiRouter(BaseRouter):
                 mac = norm_mac(m.group(1))
                 window = text[max(0, m.start() - 160) : m.end() + 160]
                 ipm = IPV4_RE.search(window)
-                if not ipm or ipm.group(1).startswith(("0.", "255.")):
+                if not ipm or not valid_ipv4(ipm.group(1)) or ipm.group(1).startswith(("0.", "255.")):
                     continue
                 entry = found.setdefault(mac, {"mac": mac, "ip": "", "hostname": "", "connection": ""})
                 entry["ip"] = entry["ip"] or ipm.group(1)

@@ -195,6 +195,8 @@ def active_interface(prefer: str | None = None, text: str | None = None) -> Inte
     candidates = list_interfaces(text)
     if not candidates:
         return None
+    if prefer and not isinstance(prefer, str):
+        prefer = None
     if prefer:
         want = prefer.upper().replace("-", ":")
         for c in candidates:

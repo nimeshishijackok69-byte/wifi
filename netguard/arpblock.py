@@ -264,9 +264,9 @@ class ArpBlocker:
             return False, "The device has no known IP address right now."
         if not gateway_mac:
             return False, "The router's MAC address is unknown; refresh and try again."
-        if mac == normalize(iface.mac or ""):
+        if mac == normalize(iface.mac or "") or ip == iface.ip:
             return False, "That is this computer - it will never be blocked."
-        if mac == normalize(gateway_mac):
+        if mac == normalize(gateway_mac) or ip == iface.gateway:
             return False, "That is the router itself - it will never be blocked."
 
         ok, message = readiness(iface)

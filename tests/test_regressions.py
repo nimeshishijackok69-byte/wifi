@@ -746,6 +746,51 @@ def test_scan_error_and_corrupt_store() -> None:
     check("H1 non-default adapter gets no DNS gateway", eth.gateway == "", eth.gateway)
 
 
+def test_own_host_and_config_guards() -> None:
+    # Own-computer guard must work even with an empty adapter MAC (IP check).
+    iface = netinfo.Interface("Wi-Fi", "10.0.0.36", "255.255.255.0", "10.0.0.1", "", "Wi-Fi")
+    real_readiness = arpblock.readiness
+    arpblock.readiness = lambda _iface=None: (True, "")
+    blocker = arpblock.ArpBlocker()
+    try:
+        ok, msg = blocker.add("22:22:22:22:22:22", "10.0.0.36", iface, "AA:AA:AA:AA:AA:AA")
+        check("own IP refused without MAC", ok is False and "this computer" in msg.lower(), msg)
+        ok, msg = blocker.add("22:22:22:22:22:22", "10.0.0.1", iface, "AA:AA:AA:AA:AA:AA")
+        # gateway IP passed as target IP must also refuse (router guard)
+        check("gateway IP target handling", ok is False, msg)
+    finally:
+        blocker.stop()
+        arpblock.readiness = real_readiness
+
+    # selected_iface of wrong type must not crash startup.
+    import json as _json
+    store_mod = __import__("netguard.store", fromlist=["Store"])
+    s = Store.__new__(Store)
+    s.config = dict(store_mod.DEFAULT_CONFIG)
+    s.devices = {}
+    real_path = store_mod.CONFIG_FILE
+    tmp = tempfile.mkdtemp()
+    store_mod.CONFIG_FILE = os.path.join(tmp, "config.json")
+    try:
+        open(store_mod.CONFIG_FILE, "w").write(_json.dumps({"selected_iface": {"deep": True}}))
+        s.load()
+        check("non-str selected_iface coerced", s.config.get("selected_iface") == "", str(s.config.get("selected_iface")))
+        # active_interface tolerates it too
+        try:
+            netinfo.active_interface(prefer={"deep": True}, text="Wi-Fi:\n   IPv4 Address. . . : 192.168.1.36\n")
+            check("active_interface tolerates dict prefer", True)
+        except Exception as exc:
+            check("active_interface tolerates dict prefer", False, str(exc))
+    finally:
+        store_mod.CONFIG_FILE = real_path
+
+    # Malformed IPv4 never becomes a client.
+    from netguard.router import valid_ipv4, IPV4_RE
+    check("valid_ipv4 rejects 999 octet", valid_ipv4("999.999.999.999") is False)
+    check("valid_ipv4 accepts normal", valid_ipv4("192.168.1.1") is True)
+    check("router regex + check rejects 999", valid_ipv4(IPV4_RE.search("999.999.999.999").group(1)) is False)
+
+
 def main() -> int:
     test_session_expiry()
     test_account_page_is_not_login_expiry()
@@ -766,6 +811,7 @@ def main() -> int:
     test_arp_error_clears()
     test_fingerprint_https_and_mdns()
     test_scan_error_and_corrupt_store()
+    test_own_host_and_config_guards()
 
     print()
     print("FAILED: " + ", ".join(FAILS) if FAILS else "ALL REGRESSION TESTS PASSED")

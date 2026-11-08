@@ -96,6 +96,10 @@ class Store:
                 cfg = json.load(fh)
                 if isinstance(cfg, dict):
                     self.config.update(cfg)
+                # A wrong-typed value (e.g. a dict for selected_iface) used to
+                # crash startup in active_interface(); only strings are valid.
+                if not isinstance(self.config.get("selected_iface"), str):
+                    self.config["selected_iface"] = ""
         except Exception:
             pass
         try:
