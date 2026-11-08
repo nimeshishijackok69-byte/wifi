@@ -93,12 +93,20 @@ class Store:
     def load(self) -> None:
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as fh:
-                self.config.update(json.load(fh))
+                cfg = json.load(fh)
+                if isinstance(cfg, dict):
+                    self.config.update(cfg)
         except Exception:
             pass
         try:
             with open(DEVICES_FILE, "r", encoding="utf-8") as fh:
-                self.devices = json.load(fh)
+                data = json.load(fh)
+                # C3: a list/scalar devices.json used to load fine and then
+                # brick every scan. Only accept a dict of dicts.
+                if isinstance(data, dict):
+                    self.devices = {k: v for k, v in data.items() if isinstance(v, dict)}
+                else:
+                    self.devices = {}
         except Exception:
             self.devices = {}
 
@@ -133,7 +141,11 @@ class Store:
 
     # -- device records ---------------------------------------------------
     def record(self, mac: str) -> dict:
-        return self.devices.setdefault(mac, {"name": "", "first_seen": 0, "last_seen": 0, "blocked": False})
+        rec = self.devices.get(mac)
+        if not isinstance(rec, dict):
+            rec = {"name": "", "first_seen": 0, "last_seen": 0, "blocked": False}
+            self.devices[mac] = rec
+        return rec
 
     def merge_scan(self, devices: dict[str, dict]) -> None:
         """devices maps mac -> {ip, hostname, vendor, ...}"""
@@ -141,6 +153,8 @@ class Store:
 
         now = time.time()
         for mac, info in devices.items():
+            if not isinstance(info, dict):
+                continue
             rec = self.record(mac)
             rec["last_seen"] = now
             if not rec.get("first_seen"):

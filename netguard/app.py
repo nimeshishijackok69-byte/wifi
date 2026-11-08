@@ -721,7 +721,9 @@ class NetGuardApp(tk.Tk):
         except Exception as exc:
             self.scanning = False
             message = f"Scan error: {exc}"
-            self.post(lambda m=message: self._scan_done({}, {}, set(), m))
+            # C1: a scanner failure must NOT look like an authoritative
+            # empty blocked set — _scan_done keeps last-known state.
+            self.post(lambda m=message: self._scan_done({}, {}, set(), m, 0, None, False, ""))
             return
 
         router_clients: dict[str, dict] = {}

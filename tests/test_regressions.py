@@ -540,6 +540,58 @@ def test_fingerprint_https_and_mdns() -> None:
     check("mDNS labels fit one byte", all(len(part) <= 63 for q in queries for part in q.rstrip(".").split(".")))
 
 
+def test_scan_error_and_corrupt_store() -> None:
+    # C3: corrupt devices.json must not brick anything.
+    import json as _json
+    store_mod = __import__("netguard.store", fromlist=["Store"])
+    s = Store.__new__(Store)
+    s.config = dict(store_mod.DEFAULT_CONFIG)
+    s.devices = {}
+    real_path = store_mod.DEVICES_FILE
+    tmp = tempfile.mkdtemp()
+    store_mod.DEVICES_FILE = os.path.join(tmp, "devices.json")
+    try:
+        open(store_mod.DEVICES_FILE, "w").write("[]")
+        s.load()
+        check("list devices.json coerced to {}", s.devices == {}, str(s.devices))
+        # non-dict record is replaced, not fatal
+        open(store_mod.DEVICES_FILE, "w").write(_json.dumps({"AA:BB:CC:DD:EE:FF": "garbage"}))
+        s.load()
+        rec = s.record("AA:BB:CC:DD:EE:FF")
+        check("non-dict record coerced", isinstance(rec, dict) and rec["blocked"] is False, str(rec))
+    finally:
+        store_mod.DEVICES_FILE = real_path
+
+    # C1: scanner exception must not forge authoritative blocked=set().
+    import inspect as _inspect
+    src = _inspect.getsource(appmod.NetGuardApp._scan_worker)
+    check("scanner error path passes router_ok=False", "_scan_done({}, {}, set(), m, 0, None, False" in src, "")
+
+    # H1: non-default adapter must not invent a DNS-as-gateway.
+    split = (
+        "Wi-Fi:\n"
+        "   IPv4 Address. . . : 192.168.1.36\n"
+        "   Subnet Mask . . . : 255.255.255.0\n"
+        "   Default Gateway . : 192.168.1.1\n"
+        "   DNS Servers . . . : 192.168.1.2\n"
+        "   Physical Address. : AA-BB-CC-DD-EE-FF\n"
+    )
+    routes = " 0.0.0.0 0.0.0.0 192.168.1.1 192.168.1.36 10\n"
+    iface = netinfo.list_interfaces(split, routes=routes)[0]
+    check("H1 default adapter keeps route gateway", iface.gateway == "192.168.1.1", iface.gateway)
+    # A second NIC whose route belongs to Wi-Fi gets NO invented gateway.
+    split2 = split + (
+        "\nEthernet:\n"
+        "   IPv4 Address. . . : 172.16.0.5\n"
+        "   Subnet Mask . . . : 255.255.255.0\n"
+        "   DNS Servers . . . : 172.16.0.2\n"
+        "   Physical Address. : 11-22-33-44-55-66\n"
+    )
+    ifaces = netinfo.list_interfaces(split2, routes=routes)
+    eth = [i for i in ifaces if i.ip == "172.16.0.5"][0]
+    check("H1 non-default adapter gets no DNS gateway", eth.gateway == "", eth.gateway)
+
+
 def main() -> int:
     test_session_expiry()
     test_http_error_is_not_empty()
@@ -554,6 +606,7 @@ def main() -> int:
     test_elevation_and_npcap()
     test_arp_error_clears()
     test_fingerprint_https_and_mdns()
+    test_scan_error_and_corrupt_store()
 
     print()
     print("FAILED: " + ", ".join(FAILS) if FAILS else "ALL REGRESSION TESTS PASSED")

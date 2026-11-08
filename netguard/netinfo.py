@@ -122,10 +122,12 @@ def list_interfaces(text: str | None = None, routes: str | None = None) -> list[
                     matched = False
             if matched:
                 gateway = route_gateway
-        if not gateway:
-            # No route table available (offline/synthetic input): the gateway
-            # is the first *other* in-subnet address.  Picking the last one
-            # (the old behaviour) selects a LAN DNS server when one exists.
+        if not gateway and not route_gateway:
+            # Only when there is NO route table at all (offline/synthetic
+            # input) may we guess the gateway as the first *other* in-subnet
+            # address. H1: when a default route exists but belongs to another
+            # adapter, inventing a gateway here picks the LAN DNS server and
+            # ARP-poisons the wrong host. Leave it "" and let readiness refuse.
             for other in ips:
                 if other == ip or other == mask:
                     continue
