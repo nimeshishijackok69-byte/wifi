@@ -56,18 +56,28 @@ _IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 _MAC_FULL_RE = re.compile(r"\b([0-9A-Fa-f]{2}(?:[-:][0-9A-Fa-f]{2}){5})\b")
 
 
-def list_interfaces(text: str | None = None) -> list[Interface]:
+def list_interfaces(text: str | None = None, routes: str | None = None) -> list[Interface]:
     """Enumerate IPv4 interfaces from ipconfig, locale-independently.
 
     Fix 7: the old parser matched English labels ("IPv4 Address", "Default
     Gateway", ...), so non-English Windows returned nothing. IP addresses,
     subnet masks and MACs are the same in every locale, so this parses
     values by shape instead of labels.
+
+    The gateway comes from the IPv4 routing table, not from ipconfig's
+    presentation order.  ipconfig lists DNS servers after the gateway, and a
+    LAN that runs its own resolver (Pi-hole/AdGuard) therefore used to
+    masquerade as the router — wrong admin URL, wrong safety guard, and ARP
+    replies forged with the wrong source address.
     """
     if text is None:
         text = _run(["ipconfig", "/all"], timeout=8)
+        if routes is None:
+            routes = _run(["route", "print", "-4"], timeout=6)
     if not text:
         return []
+
+    route_gateway, route_iface = parse_default_route(routes) if routes else ("", "")
 
     blocks: list[dict] = []
     current: dict | None = None
@@ -100,15 +110,69 @@ def list_interfaces(text: str | None = None) -> list[Interface]:
             net = ipaddress.IPv4Network(f"{ip}/{mask}", strict=False)
         except ValueError:
             net = ipaddress.IPv4Network(f"{ip}/24", strict=False)
-        # Gateway = a different address inside our own subnet, last one wins
-        # (ipconfig lists it after the interface address).
+
         gateway = ""
-        for other in ips:
-            if other != ip and ipaddress.ip_address(other) in net:
-                gateway = other
+        if route_gateway:
+            if route_iface:
+                matched = route_iface == ip
+            else:
+                try:
+                    matched = ipaddress.ip_address(route_gateway) in net
+                except ValueError:
+                    matched = False
+            if matched:
+                gateway = route_gateway
+        if not gateway:
+            # No route table available (offline/synthetic input): the gateway
+            # is the first *other* in-subnet address.  Picking the last one
+            # (the old behaviour) selects a LAN DNS server when one exists.
+            for other in ips:
+                if other == ip or other == mask:
+                    continue
+                try:
+                    if ipaddress.ip_address(other) in net:
+                        gateway = other
+                        break
+                except ValueError:
+                    continue
         mac = block["macs"][0] if block["macs"] else ""
         candidates.append(Interface(block["title"], ip, mask, gateway, mac, block["title"]))
     return candidates
+
+
+def parse_default_route(text: str) -> tuple[str, str]:
+    """Return ``(gateway, interface_ip)`` for the best IPv4 default route.
+
+    ``route print -4`` rows are:
+    ``0.0.0.0  0.0.0.0  192.168.1.1  192.168.1.36  25``
+    The lowest metric wins (Windows itself uses it).
+    """
+    best: tuple[str, str, int] | None = None
+    for line in (text or "").splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        destination, netmask, gateway = parts[0], parts[1], parts[2]
+        if destination != "0.0.0.0" or netmask != "0.0.0.0":
+            continue
+        if not _IPV4_RE.fullmatch(gateway) or gateway.startswith(("0.", "255.")):
+            continue
+        iface = parts[3] if _IPV4_RE.fullmatch(parts[3]) else ""
+        metric = 1 << 30
+        if len(parts) >= 5:
+            try:
+                metric = int(parts[4])
+            except ValueError:
+                pass
+        if best is None or metric < best[2]:
+            best = (gateway, iface, metric)
+    return (best[0], best[1]) if best else ("", "")
+
+
+def default_route(text: str | None = None) -> tuple[str, str]:
+    if text is None:
+        text = _run(["route", "print", "-4"], timeout=6)
+    return parse_default_route(text)
 
 
 def iface_key(iface: Interface | None) -> str:

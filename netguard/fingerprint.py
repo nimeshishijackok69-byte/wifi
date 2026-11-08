@@ -22,6 +22,7 @@ from __future__ import annotations
 import http.client
 import re
 import socket
+import ssl
 import struct
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -124,11 +125,18 @@ def _open_ports(ip: str) -> list[int]:
 
 def _http_fingerprint(ip: str, ports: list[int]) -> list[str]:
     notes: list[str] = []
-    for port in (80, 8080, 8000):
+    for port in (80, 8080, 8000, 443):
         if port not in ports:
             continue
         try:
-            conn = http.client.HTTPConnection(ip, port, timeout=0.6)
+            if port == 443:
+                # The port is probed above but the page was never requested:
+                # an HTTPS-only admin page lost its Server header and title.
+                conn = http.client.HTTPSConnection(
+                    ip, port, timeout=0.6, context=ssl._create_unverified_context()
+                )
+            else:
+                conn = http.client.HTTPConnection(ip, port, timeout=0.6)
             conn.request("GET", "/", headers={"User-Agent": "NetGuard/1.0"})
             resp = conn.getresponse()
             server = resp.getheader("Server", "").strip()
@@ -243,17 +251,20 @@ def _parse_mdns(packet: bytes) -> list[str]:
     return out
 
 
+_MDNS_QUERIES = (
+    "_services._dns-sd._udp.local.",
+    "_http._tcp.local.",
+    "_airplay._tcp.local.",
+    "_raop._tcp.local.",
+    "_sftp-ssh._tcp.local.",
+    "_ipp._tcp.local.",
+    "_hap._tcp.local.",
+)
+
+
 def _mdns(ip: str) -> list[str]:
     records: list[str] = []
-    queries = (
-        "_services._dns-sd._udp.local.",
-        "_http._tcp.local.",
-        "_airplay._tcp.local.",
-        "_raop._tcp.local.",
-        "_sftp-ssh._tcp.local.",
-        "_ipp._tcp.local.",
-        "_homekit-s accessory._tcp.local.",
-    )
+    queries = _MDNS_QUERIES
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.settimeout(0.5)
@@ -350,7 +361,7 @@ def guess(ip: str, mac: str, vendor: str = "", hostname: str = "") -> Fingerprin
         return Fingerprint("TV / streaming device", "tv", "High", randomized, evidence)
     if _contains(all_text, _IOT_WORDS):
         return Fingerprint("Smart home / IoT device", "iot", "Medium", randomized, evidence)
-    if _contains(all_text, _ROUTER_WORDS) or 1900 in ports or "boa" in all_text:
+    if _contains(all_text, _ROUTER_WORDS) or "boa" in all_text:
         return Fingerprint("Router / access point", "router", "Medium", randomized, evidence)
 
     if 445 in ports:

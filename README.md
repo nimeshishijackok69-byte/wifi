@@ -21,7 +21,7 @@ NetGuard/
 
 The core app needs only Python 3.10+ and the standard library. **Force offline**
 additionally needs:
-- the free **Npcap** packet driver (Wireshark/Nmap use it; the app can install it),
+- the free **Npcap** packet driver (Wireshark/Nmap use it; the app opens its official download page),
 - the **scapy** Python package (`pip install scapy`), and
 - the app running **as administrator** (`NetGuard-admin.bat`).
 
@@ -73,8 +73,8 @@ not forwarded — this is a block, not a man-in-the-middle.
 
 What it needs:
 
-1. **Npcap** installed (free; <https://npcap.com>). NetGuard offers to launch the
-   installer the first time you need it.
+1. **Npcap** installed (free; <https://npcap.com>). NetGuard opens the official
+   download page the first time you need it; it never runs an installer itself.
 2. NetGuard started **as administrator** (`NetGuard-admin.bat`, or accept the
    “Restart as administrator” prompt). Windows requires this to send raw frames.
 3. This PC switched on and on the same network.
@@ -198,7 +198,8 @@ Windows may isolate clients (guest Wi-Fi / AP isolation) or the PC is on a
 different subnet. Use the router login: the DHCP list still shows every client.
 
 **“Force offline” says it needs the Npcap driver**
-Install Npcap (the app offers the installer), then restart NetGuard.
+Install Npcap from <https://npcap.com> (NetGuard opens that page for you), then
+restart NetGuard.
 
 **“Force offline” says it needs administrator**
 Close and open **NetGuard-admin.bat**, or accept the “Restart as administrator”
@@ -218,6 +219,7 @@ python tests\test_app_flow.py
 python tests\test_arpblock.py
 python tests\test_fingerprint.py
 python tests\test_network_names.py
+python tests\test_regressions.py
 ```
 
 The first runs the full router flow (login → client list → block → verify →
@@ -227,6 +229,10 @@ safety guards and the exact frames that would be sent (no packets leave the PC).
 The fourth checks the randomised-MAC detector, the mDNS parser and the
 identification cache. The fifth checks the gateway PTR name lookup, both
 against a canned DNS reply and, on a live network, against the router itself.
+The last locks down the audited failure modes: session expiry, HTTP errors,
+filter-mode detection, slot-based verification, delete-form selection, phantom
+client rows, IP preservation, gateway selection, CSV injection, elevation
+failure and the Npcap flow.
 
 `tools\fingerprint_devices.py` prints the current LAN identification guesses.
 `tools\arp_selftest.py` is a one-off check that this PC can actually send raw

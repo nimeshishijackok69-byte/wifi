@@ -58,8 +58,8 @@ Your list may change as people join or leave the network.
 
 “Force offline” needs a free program called **Npcap**. It is the same packet driver used by Wireshark and Nmap.
 
-- If NetGuard asks you to install it, click **Yes**.
-- If you see the Npcap installer, click **Next** a few times and then **Finish**.
+- If NetGuard asks you to get it, click **Yes** to open the official Npcap download page in your browser.
+- Download and run the Npcap installer, click **Next** a few times and then **Finish**.
 - If Npcap is already installed, you do not need to do anything here.
 
 ### Step 2: run NetGuard as administrator
@@ -191,7 +191,7 @@ With a **router block**, the router drops the device itself. Its status in NetGu
 
 ### It says Npcap is missing. What do I do?
 
-Install Npcap using **Force offline**'s prompt, then restart NetGuard.
+Install Npcap from <https://npcap.com> (the **Force offline** prompt opens that page), then restart NetGuard.
 
 ### It says it needs administrator. What do I do?
 

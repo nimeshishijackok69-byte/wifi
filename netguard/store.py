@@ -147,7 +147,10 @@ class Store:
                 rec["first_seen"] = now
             if info.get("hostname") and not rec.get("name"):
                 rec["hostname"] = info["hostname"]
-            rec["ip"] = info.get("ip", rec.get("ip", ""))
+            # An empty IP means "unknown this scan", not "forget the address".
+            # The router-only view used to wipe a known address, after which
+            # "Force offline" had nothing to target.
+            rec["ip"] = info.get("ip") or rec.get("ip", "")
             if "blocked" in info:
                 rec["blocked"] = bool(info["blocked"])
             for key in ("guess", "guess_category", "guess_confidence", "guess_evidence"):

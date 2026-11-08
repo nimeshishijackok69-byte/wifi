@@ -16,7 +16,7 @@ from tkinter import filedialog, messagebox, ttk
 from . import APP_NAME, __version__, fingerprint, netinfo, scanner
 from .arpblock import ArpBlocker, is_admin, npcap_installed
 from .oui import VendorDB, normalize
-from .router import HuaweiRouter, LoginError, RouterError
+from .router import HuaweiRouter, LoginError, RouterError, SessionExpired
 from .store import APP_DIR, Store
 
 # --------------------------------------------------------------------------
@@ -55,6 +55,19 @@ def human(ts: float) -> str:
     if not ts:
         return "-"
     return time.strftime("%d %b %Y, %H:%M", time.localtime(ts))
+
+
+# Spreadsheet programs execute cells that begin with one of these.  A device
+# name or a router-supplied string is untrusted input, so exported CSV must
+# never let it become a formula (CSV injection).
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r", "\n")
+
+
+def csv_safe(value) -> str:
+    text = "" if value is None else str(value)
+    if text.startswith(_CSV_FORMULA_PREFIXES):
+        return "'" + text
+    return text
 
 
 def find_mac_aliases(
@@ -818,7 +831,7 @@ class NetGuardApp(tk.Tk):
             live = raw.get(mac)
             row = Row(
                 mac=mac,
-                ip=(live or {}).get("ip", rec.get("ip", "")),
+                ip=(live or {}).get("ip") or rec.get("ip", ""),
                 name=rec.get("name") or (live or {}).get("hostname", ""),
                 vendor=self.vendors.lookup(mac),
                 guess=(live or {}).get("guess") or rec.get("guess", ""),
@@ -847,7 +860,8 @@ class NetGuardApp(tk.Tk):
         # Devices the router knows but the store has never seen.
         for mac, info in raw.items():
             if mac not in rows:
-                row = Row(mac=mac, ip=info["ip"], name=info["hostname"], vendor=self.vendors.lookup(mac),
+                row = Row(mac=mac, ip=info.get("ip") or self.store.devices.get(mac, {}).get("ip", ""),
+                          name=info["hostname"], vendor=self.vendors.lookup(mac),
                           guess=info.get("guess", ""), evidence=tuple(info.get("guess_evidence") or ()),
                           randomized=bool(info.get("randomized", False)),
                           connection=info["connection"], online=True, blocked=mac in blocked,
@@ -1062,17 +1076,14 @@ class NetGuardApp(tk.Tk):
 
         def work():
             try:
-                ok, msg = self.router.set_block(row.mac, not unblock)
-                # Fix 3 (repaired): one relogin + retry if the session went
-                # stale. A dead session surfaces as a login-page redirect
-                # ("No MAC address field…", 403, …), not the literal words
-                # "logged in" — match the session indicators too.
-                if not ok and any(k in msg.lower() for k in ("logged in", "filter page", "session", "http 40", "login.asp", "not logged")):
-                    try:
-                        self.router.relogin()
-                        ok, msg = self.router.set_block(row.mac, not unblock)
-                    except Exception as relog_exc:
-                        msg = f"{msg} (relogin failed: {relog_exc})"
+                try:
+                    ok, msg = self.router.set_block(row.mac, not unblock)
+                except SessionExpired:
+                    ok, msg = False, "Router session expired."
+                # One structural relogin + retry when the session went stale.
+                if not ok and ("not logged in" in msg.lower() or "session expired" in msg.lower()):
+                    self.router.relogin()
+                    ok, msg = self.router.set_block(row.mac, not unblock)
                 self.post(lambda: self._block_done(row.mac, ok, msg, unblock))
             except Exception as exc:
                 message = str(exc)
@@ -1268,7 +1279,7 @@ class NetGuardApp(tk.Tk):
         if "Npcap" in message:
             answer = messagebox.askyesno(
                 APP_NAME,
-                message + "\n\nInstall it now? (Free, one installer window. Restart NetGuard afterwards.)",
+                message + "\n\nOpen the official download page now? Restart NetGuard after installing.",
             )
             if answer:
                 self._install_npcap()
@@ -1280,18 +1291,11 @@ class NetGuardApp(tk.Tk):
         messagebox.showerror(APP_NAME, message)
 
     def _install_npcap(self) -> None:
-        installer = os.path.join(os.environ.get("TEMP", ""), "opencode", "npcap-1.90.exe")
-        if os.path.exists(installer):
-            try:
-                import ctypes
-
-                ctypes.windll.shell32.ShellExecuteW(None, "runas", installer, "", None, 1)
-                self.log_line("Npcap installer opened - follow the wizard, then restart NetGuard.")
-                return
-            except Exception:
-                pass
+        # Only ever point the user at the vendor's own page.  Running an
+        # installer from a predictable temp path (the old behaviour) would
+        # execute whatever happened to be there, with administrator rights.
         webbrowser.open("https://npcap.com/#download")
-        self.log_line("Opened npcap.com - download and install it, then restart NetGuard.")
+        self.log_line("Opened npcap.com - download and install Npcap, then restart NetGuard.")
 
     def _relaunch_admin(self) -> None:
         if is_admin():
@@ -1305,9 +1309,18 @@ class NetGuardApp(tk.Tk):
                 target = sys.executable
             else:
                 target = sys.executable
-            ctypes.windll.shell32.ShellExecuteW(None, "runas", target, params, os.getcwd(), 1)
+            result = ctypes.windll.shell32.ShellExecuteW(None, "runas", target, params, os.getcwd(), 1)
         except Exception as exc:
             messagebox.showerror(APP_NAME, f"Could not restart as administrator:\n{exc}")
+            return
+        # ShellExecuteW returns a value > 32 on success (an HINSTANCE), or an
+        # error code <= 32.  Closing the app on failure lost the session.
+        if not result or int(result) <= 32:
+            messagebox.showerror(
+                APP_NAME,
+                "Could not restart as administrator (Windows declined the request).\n"
+                "Close NetGuard and run NetGuard-admin.bat instead.",
+            )
             return
         self._on_close()
 
@@ -1410,11 +1423,13 @@ class NetGuardApp(tk.Tk):
                 writer = csv.writer(fh)
                 writer.writerow(["Name", "Likely device", "Evidence", "IP", "MAC", "Vendor", "Type", "Online", "Blocked (router)", "Forced offline (ARP)", "First seen", "Last seen"])
                 for row in sorted(self.rows.values(), key=lambda r: (r.name or r.ip)):
-                    writer.writerow([row.title, row.guess or "Unknown device", "; ".join(row.evidence),
-                                     row.ip, row.mac, row.vendor, row.kind,
-                                     "yes" if row.online else "no", "yes" if row.blocked else "no",
-                                     "yes" if row.arp_blocked else "no",
-                                     human(row.first_seen), human(row.last_seen)])
+                    writer.writerow([csv_safe(value) for value in (
+                        row.title, row.guess or "Unknown device", "; ".join(row.evidence),
+                        row.ip, row.mac, row.vendor, row.kind,
+                        "yes" if row.online else "no", "yes" if row.blocked else "no",
+                        "yes" if row.arp_blocked else "no",
+                        human(row.first_seen), human(row.last_seen),
+                    )])
             self.footer.configure(text=f"Exported to {path}")
         except Exception as exc:
             messagebox.showerror(APP_NAME, f"Could not export:\n{exc}")

@@ -99,11 +99,13 @@ def main() -> int:
         ok6, msg6 = router._add_mac(parse_page(dup_html), target)
         check("already-blocked is idempotent", ok6 is True, msg6)
 
-        # Fix 8: allow-list (whitelist) mode must refuse, both via the
-        # learned flag and via live page text.
+        # Fix 2/8: a stale "allow" flag must not outlive the live page. The
+        # mock page selects blacklist (filtertype=0), so blocking proceeds
+        # and the semantics are recomputed from the page, not the old flag.
         router._filter_semantics = "allow"
         ok8, msg8 = router.set_block(target, True)
-        check("allow-list refuses via flag", ok8 is False and "allow-list" in msg8.lower(), msg8)
+        check("stale allow flag cleared by live page", ok8 is True and router._filter_semantics != "allow", msg8)
+        router.set_block(target, False)
         router._filter_semantics = ""
         orig2 = router._filter_page_html
         router._filter_page_html = lambda: "<html><body>Whitelist mode is on. MAC filter whitelist.</body></html>"

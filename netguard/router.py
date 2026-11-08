@@ -34,6 +34,35 @@ class LoginError(RouterError):
     pass
 
 
+class SessionExpired(RouterError):
+    """The router answered with its login page instead of real content.
+
+    A dropped session must never look like a successful read: returning an
+    empty page would make the UI show every blocked device as unblocked.
+    """
+
+
+# Explicit mode wording only.  "Whitelist" appearing as one *unselected*
+# option must not switch the semantics — see _learn_filter_mode().
+_ALLOW_RE = re.compile(
+    r"\b(?:white[\s_-]*list|allow[\s_-]*list|permit[\s_-]*list|allowed[\s_-]*list)\b",
+    re.I,
+)
+_BLOCK_RE = re.compile(
+    r"\b(?:black[\s_-]*list|block[\s_-]*list|deny[\s_-]*list|denied[\s_-]*list)\b",
+    re.I,
+)
+
+
+def _mode_word(text: str) -> str:
+    text = text or ""
+    if _ALLOW_RE.search(text):
+        return "allow"
+    if _BLOCK_RE.search(text):
+        return "block"
+    return ""
+
+
 def norm_mac(mac: str) -> str:
     hexonly = "".join(ch for ch in str(mac) if ch in "0123456789abcdefABCDEF")
     if len(hexonly) < 12:
@@ -50,6 +79,7 @@ class Form:
         self.action = action
         self.method = method or "post"
         self.inputs: list[dict] = []
+        self.selects: dict[str, list[dict]] = {}
 
     @property
     def names(self) -> list[str]:
@@ -60,6 +90,21 @@ class Form:
             if i.get("name") == name:
                 return str(i.get("value", ""))
         return ""
+
+    def options(self, name: str) -> list[dict]:
+        return self.selects.get(name, [])
+
+    def selected_option(self, name: str) -> dict | None:
+        """The option the browser would submit, with its human label."""
+        options = self.options(name)
+        for option in options:
+            if option.get("selected"):
+                return option
+        chosen = self.value(name)
+        for option in options:
+            if str(option.get("value", "")) == chosen:
+                return option
+        return options[0] if options else None
 
     def default_data(self) -> list[tuple[str, str]]:
         data: list[tuple[str, str]] = []
@@ -95,6 +140,7 @@ class _PageParser(HTMLParser):
         self._cell: list[str] | None = None
         self._form: Form | None = None
         self._select: dict | None = None
+        self._option: dict | None = None
 
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
@@ -120,7 +166,12 @@ class _PageParser(HTMLParser):
         elif tag == "select" and self._form is not None:
             self._select = {"name": a.get("name", ""), "options": []}
         elif tag == "option" and self._select is not None:
-            self._select["options"].append({"value": a.get("value", ""), "selected": "selected" in a})
+            self._option = {
+                "value": a.get("value", ""),
+                "selected": "selected" in a,
+                "label": "",
+            }
+            self._select["options"].append(self._option)
         elif tag in ("a", "frame", "iframe"):
             ref = a.get("href") or a.get("src")
             if ref:
@@ -139,10 +190,15 @@ class _PageParser(HTMLParser):
         elif tag in ("td", "th") and self._cell is not None and self._row is not None:
             self._row.append(" ".join("".join(self._cell).split()))
             self._cell = None
+        elif tag == "option":
+            if self._option is not None:
+                self._option["label"] = " ".join(self._option["label"].split())
+                self._option = None
         elif tag == "select" and self._select is not None and self._form is not None:
             if self._select["name"]:
                 opts = self._select["options"]
                 chosen = [o for o in opts if o["selected"]] or opts[:1]
+                self._form.selects[self._select["name"]] = [dict(o) for o in opts]
                 self._form.inputs.append(
                     {"name": self._select["name"], "value": chosen[0]["value"] if chosen else "", "type": "select"}
                 )
@@ -151,6 +207,8 @@ class _PageParser(HTMLParser):
             self._form = None
 
     def handle_data(self, data):
+        if self._option is not None:
+            self._option["label"] += data
         if self._cell is not None:
             self._cell.append(data)
 
@@ -162,6 +220,80 @@ def parse_page(html: str) -> _PageParser:
     except Exception:
         pass
     return p
+
+
+def filter_macs(html: str) -> set[str]:
+    """Every MAC the filter page is actually holding.
+
+    Firmware represents the same list in one of three places: a table row, a
+    text slot in the add/edit form, or a per-row delete checkbox/link.  The
+    old code only read tables, so on slot-based firmware verification was
+    blind: a failed unblock reported "Applied and verified" and a successful
+    block reported "the router did not apply the change".
+    """
+    page = parse_page(html)
+    macs: set[str] = set()
+
+    for table in page.tables:
+        for row in table:
+            for cell in row:
+                for match in MAC_RE.finditer(cell):
+                    macs.add(norm_mac(match.group(1)))
+
+    for form in page.forms:
+        for inp in form.inputs:
+            kind = str(inp.get("type", "")).lower()
+            if kind in ("submit", "button", "reset", "image"):
+                continue
+            for match in MAC_RE.finditer(str(inp.get("value", ""))):
+                macs.add(norm_mac(match.group(1)))
+
+    # Per-row delete links (…?macaddr=AA:BB:…&action=delete).
+    for link in page.links:
+        low = link.lower()
+        if not any(word in low for word in ("del", "remove", "action=delete")):
+            continue
+        for match in MAC_RE.finditer(link):
+            macs.add(norm_mac(match.group(1)))
+
+    return macs
+
+
+def _delete_form_score(form: Form, mac: str) -> int:
+    """How strongly a form looks like *the* delete control for ``mac``.
+
+    An add form can also contain the MAC (firmware pre-fills its slots), so
+    the presence of a MAC alone is not enough.  Explicit delete controls win;
+    an "Add" button is a strong signal that the form is not a delete form.
+    """
+    score = 0
+    action = (form.action or "").lower()
+    if any(word in action for word in ("del", "remove", "delete")):
+        score += 6
+
+    has_add_button = False
+    for inp in form.inputs:
+        name = str(inp.get("name", "")).lower()
+        kind = str(inp.get("type", "text")).lower()
+        value = str(inp.get("value", ""))
+        if kind in ("submit", "button", "reset", "image"):
+            if any(word in name for word in ("del", "remove")):
+                score += 10
+            elif "add" in name:
+                has_add_button = True
+            continue
+        if norm_mac(value) != mac:
+            continue
+        if any(word in name for word in ("del", "remove")):
+            score += 9
+        elif kind in ("checkbox", "radio"):
+            score += 8
+        elif "mac" in name:
+            score += 1
+
+    if has_add_button:
+        score -= 4
+    return score
 
 
 # --------------------------------------------------------------------------
@@ -194,20 +326,54 @@ class BaseRouter:
         return urllib.parse.urljoin(self.base_url + "/", path.lstrip("/"))
 
     def _open(self, req, path):
+        """Return ``(body, status, final_url)``; never hide an HTTP error."""
         try:
             with self.opener.open(req, timeout=self.timeout) as resp:
-                return resp.read().decode("utf-8", errors="ignore")
+                body = resp.read().decode("utf-8", errors="ignore")
+                status = int(getattr(resp, "status", 200) or 200)
+                return body, status, resp.geturl()
         except urllib.error.HTTPError as exc:
             try:
-                return exc.read().decode("utf-8", errors="ignore")
+                body = exc.read().decode("utf-8", errors="ignore")
             except Exception:
-                raise RouterError(f"HTTP {exc.code} for {path}")
+                body = ""
+            return body, int(exc.code), getattr(exc, "url", path) or path
         except Exception as exc:
             raise RouterError(str(exc))
 
+    @staticmethod
+    def _is_login_request(path: str) -> bool:
+        low = (path or "").lower()
+        return "login.asp" in low or "formlogin" in low
+
+    @staticmethod
+    def _looks_like_login(url: str, body: str) -> bool:
+        if "login.asp" in (url or "").lower():
+            return True
+        low = body.lower()
+        if "<form" not in low:
+            return False
+        return (
+            "name=\"psd\"" in low
+            or "name='psd'" in low
+            or "formlogin" in low
+        )
+
+    def _request(self, req, path: str) -> str:
+        body, status, final_url = self._open(req, path)
+        if status >= 400:
+            raise RouterError(f"Router returned HTTP {status} for {path}")
+        # Most Boa/Huawei firmware answers an expired cookie with a 302 to the
+        # login page, which urllib follows, so the status is 200 and the body
+        # is a login form.  Treat that as a dead session, never as content.
+        if not self._is_login_request(path) and self._looks_like_login(final_url, body):
+            self.logged_in = False
+            raise SessionExpired(f"Router session expired (login page returned for {path}).")
+        return body
+
     def get(self, path: str) -> str:
         with self._lock:
-            return self._open(urllib.request.Request(self._url(path)), path)
+            return self._request(urllib.request.Request(self._url(path)), path)
 
     def post(self, path: str, data, referer: str = "") -> str:
         body = urllib.parse.urlencode(data).encode()
@@ -216,7 +382,7 @@ class BaseRouter:
         if referer:
             req.add_header("Referer", self._url(referer))
         with self._lock:
-            return self._open(req, path)
+            return self._request(req, path)
 
     # -- interface --------------------------------------------------------
     def login(self, username: str, password: str) -> str:
@@ -305,8 +471,11 @@ class HuaweiRouter(BaseRouter):
         if "bad password" in low:
             raise LoginError("Bad password")
 
-        probe = self.get("/html/ssmp/frame.asp")
-        if "login.asp" in probe.lower() and "<form" in probe.lower() and "password" in probe.lower():
+        try:
+            probe = self.get("/html/ssmp/frame.asp")
+        except SessionExpired as exc:
+            raise LoginError("Login was rejected") from exc
+        if self._looks_like_login("", probe):
             raise LoginError("Login was rejected")
 
         self.logged_in = True
@@ -327,12 +496,16 @@ class HuaweiRouter(BaseRouter):
         self._pages = {}
         self._client_page = ""
         self._filter_page = ""
+        self._filter_mode = ""
+        self._filter_semantics = ""
         return self.login(self._user, self._password)
 
     def _read_identity(self) -> None:
         for path in ("/html/ssmp/deviceinfo/deviceinfo.asp", "/html/ssmp/index.asp"):
             try:
                 page = self.get(path)
+            except SessionExpired:
+                raise
             except RouterError:
                 continue
             text = re.sub(r"<[^>]+>", " ", page)
@@ -355,6 +528,8 @@ class HuaweiRouter(BaseRouter):
                 continue
             try:
                 html = self.get(path)
+            except SessionExpired:
+                raise
             except RouterError:
                 continue
             low = html.lower()
@@ -379,25 +554,25 @@ class HuaweiRouter(BaseRouter):
         pages = self._crawl(["/html/ssmp/frame.asp", "/html/ssmp/index.asp", "/admin/main.asp"])
         self._pages = pages
 
-        client_score: dict[str, int] = {}
         filter_score: dict[str, int] = {}
         for path, html in pages.items():
             low = (path + " " + html).lower()
-            if any(h in path.lower() for h in FILTER_HINTS) or "mac filter" in low or "filter mode" in low:
+            path_low = path.lower()
+            if (
+                any(h in path_low for h in FILTER_HINTS)
+                or "filtertype" in low
+                or "filter mode" in low
+            ):
                 filter_score[path] = filter_score.get(path, 0) + 5
                 if "filtertype" in low or "filter mode" in low:
                     filter_score[path] += 4
-            if any(h in path.lower() for h in CLIENT_HINTS):
-                client_score[path] = client_score.get(path, 0) + 2
-            if MAC_RE.search(html) and IPV4_RE.search(html):
-                client_score[path] = client_score.get(path, 0) + 3
-            if "dhcp" in low:
-                client_score[path] = client_score.get(path, 0) + 3
 
         if not filter_score:
             for path in KNOWN_FILTER_PAGES:
                 try:
                     html = self.get(path)
+                except SessionExpired:
+                    raise
                 except RouterError:
                     continue
                 if MAC_RE.search(html) or "filter" in html.lower():
@@ -405,10 +580,40 @@ class HuaweiRouter(BaseRouter):
                     filter_score[path] = 1
                     break
 
+        if filter_score:
+            self._filter_page = max(filter_score, key=filter_score.get)
+            try:
+                self._learn_filter_mode(pages.get(self._filter_page) or "")
+            except SessionExpired:
+                raise
+            except RouterError:
+                pass
+
+        # Client pages are scored only after the filter page is known: a
+        # client page may mention "MAC Filter" in its navigation, so mere
+        # word presence must not exclude it.  Only the actual filter page
+        # (and paths that are obviously filter paths) are skipped.
+        client_score: dict[str, int] = {}
+        for path, html in pages.items():
+            path_low = path.lower()
+            if path == self._filter_page or any(h in path_low for h in FILTER_HINTS):
+                continue
+            low = (path + " " + html).lower()
+            if any(h in path_low for h in CLIENT_HINTS):
+                client_score[path] = client_score.get(path, 0) + 2
+            if MAC_RE.search(html) and IPV4_RE.search(html):
+                client_score[path] = client_score.get(path, 0) + 3
+            if "dhcp" in low:
+                client_score[path] = client_score.get(path, 0) + 3
+
         if not client_score:
             for path in KNOWN_CLIENT_PAGES:
+                if path == self._filter_page or any(h in path.lower() for h in FILTER_HINTS):
+                    continue
                 try:
                     html = self.get(path)
+                except SessionExpired:
+                    raise
                 except RouterError:
                     continue
                 if MAC_RE.search(html):
@@ -418,36 +623,74 @@ class HuaweiRouter(BaseRouter):
 
         if client_score:
             self._client_page = max(client_score, key=client_score.get)
-        if filter_score:
-            self._filter_page = max(filter_score, key=filter_score.get)
-            self._learn_filter_mode()
 
-    def _learn_filter_mode(self) -> None:
-        try:
-            html = self._pages.get(self._filter_page) or self.get(self._filter_page)
-        except RouterError:
-            return
-        for form in parse_page(html).forms:
-            for name in form.names:
+    def _learn_filter_mode(self, html: str | None = None) -> None:
+        """Classify the filter as blacklist or allow-list from the live page.
+
+        Fix 2 root cause: the old code searched the whole HTML for the word
+        "whitelist".  A normal blacklist page lists *both* modes in its
+        <select>, so the mere presence of the unselected option latched
+        allow-list and disabled blocking.  Only the **selected option** of the
+        mode control (or, when there is no control, explicit visible wording)
+        may decide the semantics.  The result is recomputed every time so a
+        stale "allow" cannot outlive the page that produced it.
+        """
+        self._filter_semantics = ""
+        self._filter_mode = ""
+        if html is None:
+            if not self._filter_page:
+                return
+            try:
+                html = self.get(self._filter_page)
+            except SessionExpired:
+                raise
+            except RouterError:
+                return
+
+        page = parse_page(html)
+        modes: list[str] = []
+        for form in page.forms:
+            is_filter_form = "filter" in (form.action or "").lower() or bool(form.mac_fields())
+            for name in form.selects:
                 low = name.lower()
-                if "filtertype" in low or "mode" in low:
-                    self._filter_mode = f"{name}={form.value(name)}"
-        # Fix 8: semantics matter — in allow-list mode adding a MAC *allows*
-        # it and blocks everyone else. We only speak blacklist fluently.
-        low_html = html.lower()
-        allow_words = ("whitelist", "allow-list", "allow list", "allowlist", "permit list")
-        block_words = ("blacklist", "block-list", "block list", "blocklist", "deny list")
-        if any(w in low_html for w in allow_words):
-            self._filter_semantics = "allow"
-        elif any(w in low_html for w in block_words):
-            self._filter_semantics = "block"
-        else:
-            # Also read the mode value itself for explicit words.
-            mode_low = self._filter_mode.lower()
-            if any(w in mode_low for w in allow_words):
+                if not ("filtertype" in low or ("mode" in low and is_filter_form)):
+                    continue
+                selected = form.selected_option(name)
+                if selected is None:
+                    continue
+                self._filter_mode = f"{name}={selected.get('value', '')}"
+                modes.append(_mode_word(f"{selected.get('value', '')} {selected.get('label', '')}"))
+            for name in form.names:
+                if name in form.selects:
+                    continue
+                low = name.lower()
+                if not ("filtertype" in low or ("mode" in low and is_filter_form)):
+                    continue
+                value = form.value(name)
+                self._filter_mode = self._filter_mode or f"{name}={value}"
+                modes.append(_mode_word(value))
+
+        if any(modes):
+            if "allow" in modes:
                 self._filter_semantics = "allow"
-            elif any(w in mode_low for w in block_words):
+            elif "block" in modes:
                 self._filter_semantics = "block"
+            return
+
+        # No control gave an explicit word (numeric-only mode, or no mode
+        # control at all).  Visible text is the remaining signal, but option
+        # labels and device tables are removed first: an unselected
+        # "Whitelist" option, or a device *named* "Whitelist-Printer",
+        # must never decide anything.
+        visible = re.sub(r"<(?:script|style|select)\b.*?</(?:script|style|select)>", " ", html, flags=re.I | re.S)
+        visible = re.sub(
+            r"<table\b.*?</table>",
+            lambda m: " " if MAC_RE.search(m.group(0)) else m.group(0),
+            visible,
+            flags=re.I | re.S,
+        )
+        text = " ".join(re.sub(r"<[^>]+>", " ", visible).split())
+        self._filter_semantics = _mode_word(text)
 
     # -- clients ----------------------------------------------------------
     def clients(self) -> list[dict]:
@@ -457,11 +700,18 @@ class HuaweiRouter(BaseRouter):
         if self._client_page:
             try:
                 self._pages[self._client_page] = self.get(self._client_page)
+            except SessionExpired:
+                raise
             except RouterError:
                 pass
 
         found: dict[str, dict] = {}
         for path, html in self._pages.items():
+            # The MAC filter is a list of *blocked* addresses, not clients.
+            # Parsing it here used to invent online devices with ip="" and
+            # then wipe the stored IP in store.merge_scan().
+            if path == self._filter_page or any(h in path.lower() for h in FILTER_HINTS):
+                continue
             page = parse_page(html)
             for table in page.tables:
                 for row in table:
@@ -487,22 +737,23 @@ class HuaweiRouter(BaseRouter):
                         for tag in ("wlan", "wifi", "wireless", "ssid"):
                             if tag in text.lower():
                                 conn = "Wi-Fi"
-                    if mac:
+                    if mac and ip:
                         entry = found.setdefault(mac, {"mac": mac, "ip": "", "hostname": "", "connection": ""})
                         entry["ip"] = entry["ip"] or ip
                         entry["hostname"] = entry["hostname"] or name
                         entry["connection"] = entry["connection"] or conn
 
-            # Catch JS-driven tables where cells are not real <td>s.
+            # Catch JS-driven tables where cells are not real <td>s.  An IP
+            # near the MAC is required for the same reason.
             text = re.sub(r"<[^>]+>", " ", html)
             for m in MAC_RE.finditer(text):
                 mac = norm_mac(m.group(1))
                 window = text[max(0, m.start() - 160) : m.end() + 160]
+                ipm = IPV4_RE.search(window)
+                if not ipm or ipm.group(1).startswith(("0.", "255.")):
+                    continue
                 entry = found.setdefault(mac, {"mac": mac, "ip": "", "hostname": "", "connection": ""})
-                if not entry["ip"]:
-                    ipm = IPV4_RE.search(window)
-                    if ipm and not ipm.group(1).startswith(("0.", "255.")):
-                        entry["ip"] = ipm.group(1)
+                entry["ip"] = entry["ip"] or ipm.group(1)
         return list(found.values())
 
     # -- blocking ---------------------------------------------------------
@@ -516,42 +767,34 @@ class HuaweiRouter(BaseRouter):
     def blocked_macs(self) -> set[str]:
         """MACs currently in the router filter.
 
-        Fix 3: a read failure now raises instead of returning an empty set.
-        Returning set() made the UI show *everyone* as unblocked while the
-        router still blocked them. Callers that want the last-known state
-        (the app) pass an explicit fallback.
+        A read failure raises instead of returning an empty set: returning
+        set() made the UI show *everyone* as unblocked while the router still
+        blocked them.  Session expiry raises SessionExpired, which the app
+        answers with one relogin.
         """
         if not self.logged_in:
-            return set()
-        macs: set[str] = set()
-        html = self._filter_page_html()  # raises RouterError on failure
-        for table in parse_page(html).tables:
-            for row in table:
-                for cell in row:
-                    for m in MAC_RE.finditer(cell):
-                        macs.add(norm_mac(m.group(1)))
-        return macs
+            raise SessionExpired("Not logged in to the router.")
+        return filter_macs(self._filter_page_html())  # raises on failure
 
     def set_block(self, mac: str, blocked: bool) -> tuple[bool, str]:
         mac = norm_mac(mac)
         if not self.logged_in:
             return False, "Not logged in to the router."
-        # Fix 8: refuse on allow-list firmware — the same code would allow
-        # this device and block the rest of the LAN (the "vice versa" case).
-        if self._filter_semantics == "allow":
-            return False, (
-                "Router is in allow-list (whitelist) mode. "
-                "NetGuard only supports blacklist mode — switch the filter "
-                "to blacklist/deny on the router first."
-            )
         try:
             html = self._filter_page_html()
+        except SessionExpired:
+            raise
         except RouterError as exc:
             return False, str(exc)
-        # Re-learn semantics from the live page in case mode changed.
-        page_text = html.lower()
-        if any(w in page_text for w in ("whitelist", "allow-list", "allow list", "allowlist")):
-            self._filter_semantics = "allow"
+
+        # Always re-read the live page: in allow-list mode adding a MAC
+        # *allows* it and blocks everyone else.  NetGuard only speaks
+        # blacklist fluently, so refuse rather than do the opposite.
+        try:
+            self._learn_filter_mode(html)
+        except SessionExpired:
+            raise
+        if self._filter_semantics == "allow":
             return False, (
                 "Router is in allow-list (whitelist) mode. "
                 "NetGuard only supports blacklist mode — switch the filter "
@@ -566,19 +809,15 @@ class HuaweiRouter(BaseRouter):
         if not ok:
             return False, msg
 
-        # Verify by re-reading the filter page. Fix 3: a read failure is a
-        # failure, not a success — previously this returned
-        # "Applied (could not verify)" which the UI showed as blocked.
+        # Verify by re-reading the filter page.  A read failure is a failure,
+        # not a success — and the extractor must see slot-based entries too.
         after: set[str] | None = None
         for _attempt in range(2):
             try:
-                after = set()
-                for table in parse_page(self._filter_page_html()).tables:
-                    for row in table:
-                        for cell in row:
-                            for m in MAC_RE.finditer(cell):
-                                after.add(norm_mac(m.group(1)))
+                after = filter_macs(self._filter_page_html())
                 break
+            except SessionExpired:
+                raise
             except RouterError:
                 after = None
         if after is None:
@@ -663,6 +902,8 @@ class HuaweiRouter(BaseRouter):
         action = form.action or self._filter_page
         try:
             result = self.post(action, new_data, referer=self._filter_page)
+        except SessionExpired:
+            raise
         except RouterError as exc:
             return False, str(exc)
         if re.search(r"<h4>\s*ERROR", result, re.I):
@@ -670,39 +911,58 @@ class HuaweiRouter(BaseRouter):
         return True, "Sent"
 
     def _delete_mac(self, page: _PageParser, mac: str) -> tuple[bool, str]:
-        # 1) checkbox / hidden value carrying the MAC inside a form
+        # 1) a form that actually owns the delete control for this MAC.
+        #    Score first: firmware often pre-fills the *add* form with the
+        #    same MAC, and posting that form does nothing (or re-adds it).
+        candidates: list[tuple[int, Form, list[dict]]] = []
         for form in page.forms:
-            for inp in form.inputs:
-                value = str(inp.get("value", ""))
-                if not value or norm_mac(value) != mac:
-                    continue
-                if inp.get("type") in ("submit", "button", "reset"):
-                    continue
-                payload = form.default_data()
-                if not any(n == inp["name"] for n, _ in payload):
-                    payload.append((inp["name"], value))
-                else:
-                    payload = [(n, value if n == inp["name"] else v) for n, v in payload]
-                # Include a delete button when the router needs one.
-                for button in form.inputs:
-                    if button.get("type") in ("submit",) and button.get("name"):
-                        if any(k in button["name"].lower() for k in ("del", "remove", "apply", "ok")):
-                            payload.append((button["name"], button.get("value", "")))
-                try:
-                    self.post(form.action or self._filter_page, payload, referer=self._filter_page)
-                except RouterError:
-                    continue
+            matches = [
+                inp
+                for inp in form.inputs
+                if str(inp.get("type", "text")).lower() not in ("submit", "button", "reset", "image")
+                and norm_mac(str(inp.get("value", ""))) == mac
+            ]
+            if not matches:
+                continue
+            candidates.append((_delete_form_score(form, mac), form, matches))
+        candidates.sort(key=lambda item: -item[0])
+
+        if candidates and candidates[0][0] > 0:
+            _score, form, matches = candidates[0]
+            names = {str(inp.get("name", "")) for inp in matches if inp.get("name")}
+            payload = [(name, value) for name, value in form.default_data() if name not in names]
+            for inp in matches:
+                if inp.get("name"):
+                    payload.append((inp["name"], str(inp.get("value", ""))))
+            # Only a delete-like button.  Never press "Add" on a form that
+            # merely happens to contain the MAC.
+            for button in form.inputs:
+                name = str(button.get("name", ""))
+                low = name.lower()
+                if button.get("type") in ("submit", "image") and name:
+                    if any(k in low for k in ("del", "remove", "apply", "ok", "save")) and "add" not in low:
+                        payload.append((name, button.get("value", "")))
+                        break
+            try:
+                self.post(form.action or self._filter_page, payload, referer=self._filter_page)
+            except SessionExpired:
+                raise
+            except RouterError:
+                pass
+            else:
                 return True, "Sent"
 
         # 2) a per-row delete link such as ...?macaddr=AA:BB:..&action=delete
-        html = self._pages.get(self._filter_page, "")
-        for link in parse_page(html).links:
-            if "del" not in link.lower() and "remove" not in link.lower():
+        for link in page.links:
+            low = link.lower()
+            if not any(word in low for word in ("del", "remove", "action=delete")):
                 continue
             if mac.replace(":", "") in link.replace(":", "").replace("-", "").upper():
                 try:
                     self.get(link)
                     return True, "Sent"
+                except SessionExpired:
+                    raise
                 except RouterError:
                     continue
 
@@ -714,6 +974,8 @@ class HuaweiRouter(BaseRouter):
                 referer=self._filter_page,
             )
             return True, "Sent (fallback endpoint)"
+        except SessionExpired:
+            raise
         except RouterError as exc:
             return False, str(exc)
 

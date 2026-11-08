@@ -68,7 +68,7 @@ def readiness(iface: netinfo.Interface | None = None) -> tuple[bool, str]:
     if not npcap_installed():
         return False, (
             "The Npcap packet driver is not installed.\n\n"
-            "It is free and standard (Wireshark/Nmap use it). NetGuard can install it for you."
+            "It is free and standard (Wireshark/Nmap use it). NetGuard can open the official download page."
         )
     if not scapy_available():
         return False, "The Python package 'scapy' is missing (pip install scapy)."
@@ -292,6 +292,10 @@ class ArpBlocker:
                 self._targets.pop(mac, None)
             self._close_socket()
             return False, f"Could not send the blocking packets: {exc}"
+        # A stale failure from an earlier adapter must not keep the UI in a
+        # warning state now that sending demonstrably works again.
+        if self._last_error:
+            self.clear_error()
         return True, f"Forcing {ip} offline."
 
     def remove(self, mac: str) -> bool:
@@ -390,13 +394,19 @@ class ArpBlocker:
                 with self._lock:
                     targets = list(self._targets.values())
 
+                cycle_ok = True
                 for target in targets:
                     try:
                         self._poison(target, gateway_ip, gateway_mac, local_mac, iface_name)
                     except Exception as exc:  # keep other targets alive
+                        cycle_ok = False
                         self._last_error = str(exc)
                         if self._last_error not in self._events:
                             self._events.append(f"ARP send error: {exc}")
+                # Recovery is a fact once a full cycle has been sent again;
+                # otherwise the badge stays "check log" forever.
+                if cycle_ok and self._last_error:
+                    self.clear_error()
             except Exception as exc:  # never let the thread die silently
                 self._last_error = str(exc)
                 self._events.append(f"ARP blocker error: {exc}")
