@@ -505,7 +505,10 @@ class NetGuardApp(tk.Tk):
         """
         now = time.time()
         last = getattr(self, "_last_net_refresh", 0.0)
-        need_resolve = force or (now - last >= 45) or not self.gateway_mac
+        # M2: never re-run subprocesses on the Tk thread more often than
+        # 45 s — the old "while gateway MAC unknown, retry every tick"
+        # exemption froze the UI whenever ipconfig/route stalled.
+        need_resolve = force or (now - last >= 45)
         if need_resolve:
             self._last_net_refresh = now
             old = self.iface
@@ -569,10 +572,17 @@ class NetGuardApp(tk.Tk):
 
     def _sync_iface_combo(self) -> None:
         """Keep the header picker in step with detected adapters (Fix 7)."""
-        try:
-            ifaces = netinfo.list_interfaces()
-        except Exception:
-            ifaces = [self.iface] if self.iface else []
+        now = time.time()
+        cached = getattr(self, "_iface_cache", None)
+        cache_at = getattr(self, "_iface_cache_at", 0.0)
+        if cached is not None and now - cache_at < 45:
+            ifaces = cached
+        else:
+            try:
+                ifaces = netinfo.list_interfaces()
+            except Exception:
+                ifaces = [self.iface] if self.iface else []
+            self._iface_cache, self._iface_cache_at = ifaces, now
         self._iface_by_label = {}
         labels = []
         for iface in ifaces:
