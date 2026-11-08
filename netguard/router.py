@@ -492,6 +492,12 @@ class HuaweiRouter(BaseRouter):
             raise LoginError("Login was rejected") from exc
         if self._looks_like_login("", probe):
             raise LoginError("Login was rejected")
+        # H4: success must be POSITIVE, not "not a login shape". A firmware
+        # re-rendering the login form with name="password" would otherwise
+        # be accepted as logged-in, and every later read would be empty.
+        _low_probe = probe.lower()
+        if not any(m in _low_probe for m in ("menu", "dhcp", "frame", "ssmp", ".asp")):
+            raise LoginError("Login was rejected")
 
         self.logged_in = True
         self._read_identity()
@@ -664,12 +670,14 @@ class HuaweiRouter(BaseRouter):
 
         page = parse_page(html)
         modes: list[str] = []
+        mode_select_seen = False
         for form in page.forms:
             is_filter_form = "filter" in (form.action or "").lower() or bool(form.mac_fields())
             for name in form.selects:
                 low = name.lower()
                 if not ("filtertype" in low or ("mode" in low and is_filter_form)):
                     continue
+                mode_select_seen = True
                 selected = form.selected_option(name)
                 if selected is None:
                     continue
@@ -690,6 +698,14 @@ class HuaweiRouter(BaseRouter):
                 self._filter_semantics = "allow"
             elif "block" in modes:
                 self._filter_semantics = "block"
+            return
+
+        # C2: a visible mode <select> whose selected value carries no
+        # recognisable word (numeric-only, non-English) must fail closed —
+        # assuming blacklist here can allow one device and deny the LAN.
+        # Hidden inputs are the legacy form and do not count as a choice.
+        if mode_select_seen:
+            self._filter_semantics = "unknown"
             return
 
         # No control gave an explicit word (numeric-only mode, or no mode
@@ -814,6 +830,13 @@ class HuaweiRouter(BaseRouter):
                 "Router is in allow-list (whitelist) mode. "
                 "NetGuard only supports blacklist mode — switch the filter "
                 "to blacklist/deny on the router first."
+            )
+        if self._filter_semantics == "unknown":
+            return False, (
+                "Could not determine the router's MAC filter mode "
+                f"({self._filter_mode or 'no mode label'}). Blocking could "
+                "allow this device and deny the whole LAN, so NetGuard "
+                "refuses. Check Router diagnostics, then retry."
             )
 
         page = parse_page(html)
