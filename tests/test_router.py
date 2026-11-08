@@ -98,6 +98,20 @@ def main() -> int:
         dup_html = full_html.replace("AA:BB:CC:DD:EE:FF", target)
         ok6, msg6 = router._add_mac(parse_page(dup_html), target)
         check("already-blocked is idempotent", ok6 is True, msg6)
+
+        # Fix 8: allow-list (whitelist) mode must refuse, both via the
+        # learned flag and via live page text.
+        router._filter_semantics = "allow"
+        ok8, msg8 = router.set_block(target, True)
+        check("allow-list refuses via flag", ok8 is False and "allow-list" in msg8.lower(), msg8)
+        router._filter_semantics = ""
+        orig2 = router._filter_page_html
+        router._filter_page_html = lambda: "<html><body>Whitelist mode is on. MAC filter whitelist.</body></html>"
+        ok9, msg9 = router.set_block(target, True)
+        router._filter_page_html = orig2
+        check("allow-list refuses via page text", ok9 is False and "allow-list" in msg9.lower(), msg9)
+        check("semantics latched to allow", router._filter_semantics == "allow")
+        router._filter_semantics = ""
     finally:
         server.stop()
 

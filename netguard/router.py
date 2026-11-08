@@ -270,6 +270,7 @@ class HuaweiRouter(BaseRouter):
         self._client_page = ""
         self._filter_page = ""
         self._filter_mode = ""
+        self._filter_semantics = ""  # "allow" | "block" | ""
         self._crawled = False
         # Credentials are kept in memory only so a dropped session can be
         # re-established without asking the user again (Fix 3).
@@ -431,6 +432,22 @@ class HuaweiRouter(BaseRouter):
                 low = name.lower()
                 if "filtertype" in low or "mode" in low:
                     self._filter_mode = f"{name}={form.value(name)}"
+        # Fix 8: semantics matter — in allow-list mode adding a MAC *allows*
+        # it and blocks everyone else. We only speak blacklist fluently.
+        low_html = html.lower()
+        allow_words = ("whitelist", "allow-list", "allow list", "allowlist", "permit list")
+        block_words = ("blacklist", "block-list", "block list", "blocklist", "deny list")
+        if any(w in low_html for w in allow_words):
+            self._filter_semantics = "allow"
+        elif any(w in low_html for w in block_words):
+            self._filter_semantics = "block"
+        else:
+            # Also read the mode value itself for explicit words.
+            mode_low = self._filter_mode.lower()
+            if any(w in mode_low for w in allow_words):
+                self._filter_semantics = "allow"
+            elif any(w in mode_low for w in block_words):
+                self._filter_semantics = "block"
 
     # -- clients ----------------------------------------------------------
     def clients(self) -> list[dict]:
@@ -519,10 +536,27 @@ class HuaweiRouter(BaseRouter):
         mac = norm_mac(mac)
         if not self.logged_in:
             return False, "Not logged in to the router."
+        # Fix 8: refuse on allow-list firmware — the same code would allow
+        # this device and block the rest of the LAN (the "vice versa" case).
+        if self._filter_semantics == "allow":
+            return False, (
+                "Router is in allow-list (whitelist) mode. "
+                "NetGuard only supports blacklist mode — switch the filter "
+                "to blacklist/deny on the router first."
+            )
         try:
             html = self._filter_page_html()
         except RouterError as exc:
             return False, str(exc)
+        # Re-learn semantics from the live page in case mode changed.
+        page_text = html.lower()
+        if any(w in page_text for w in ("whitelist", "allow-list", "allow list", "allowlist")):
+            self._filter_semantics = "allow"
+            return False, (
+                "Router is in allow-list (whitelist) mode. "
+                "NetGuard only supports blacklist mode — switch the filter "
+                "to blacklist/deny on the router first."
+            )
 
         page = parse_page(html)
         if not blocked:
@@ -692,6 +726,7 @@ class HuaweiRouter(BaseRouter):
             "client_page": self._client_page or "(not found)",
             "filter_page": self._filter_page or "(not found)",
             "filter_mode": self._filter_mode or "(unknown)",
+            "filter_semantics": self._filter_semantics or "(unknown — blacklist assumed)",
             "pages_scanned": len(self._pages),
         }
 
