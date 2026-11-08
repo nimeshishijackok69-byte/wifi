@@ -228,6 +228,28 @@ class ArpBlocker:
             target = self._targets.get(normalize(mac))
             return target["ip"] if target else ""
 
+    def retarget(self, old_mac: str, new_mac: str, new_ip: str) -> bool:
+        """Move a block from a rotated MAC to its new MAC (Fix 9).
+
+        The poison loop reads targets every cycle, so repointing the dict
+        entry is enough — no thread restart. Returns False if the old MAC
+        was not blocked or the new MAC must never be adopted.
+        """
+        old_mac, new_mac = normalize(old_mac), normalize(new_mac)
+        if not old_mac or not new_mac or old_mac == new_mac or not new_ip:
+            return False
+        if new_ip in (self._gateway_ip, self._local_ip):
+            return False
+        with self._lock:
+            target = self._targets.pop(old_mac, None)
+            if target is None:
+                return False
+            self._targets[new_mac] = {"mac": new_mac, "ip": new_ip}
+            self._events.append(
+                f"{old_mac} rotated MAC -> {new_mac} ({new_ip}); block carried over."
+            )
+        return True
+
     # -- lifecycle --------------------------------------------------------
     def add(self, mac: str, ip: str, iface: netinfo.Interface, gateway_mac: str) -> tuple[bool, str]:
         mac = normalize(mac)

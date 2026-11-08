@@ -220,6 +220,15 @@ def main() -> int:
         check("refresh with targets does not raise", False, str(exc))
     b5.stop()
 
+    # Fix 9: retarget carries a block across MAC rotation -------------------
+    b6 = arpblock.ArpBlocker()
+    b6._gateway_ip, b6._local_ip = "192.168.1.1", "192.168.1.36"
+    b6._targets["E2:93:95:08:18:57"] = {"mac": "E2:93:95:08:18:57", "ip": "192.168.1.33"}
+    check("retarget ok", b6.retarget("E2:93:95:08:18:57", "AA:BB:CC:DD:EE:FF", "192.168.1.33") is True)
+    check("retarget moved entry", not b6.is_blocking("E2:93:95:08:18:57") and b6.target_ip("AA:BB:CC:DD:EE:FF") == "192.168.1.33")
+    check("retarget refuses gateway IP", b6.retarget("AA:BB:CC:DD:EE:FF", "11:22:33:44:55:66", "192.168.1.1") is False)
+    b6.stop()
+
     print()
     print("FAILED: " + ", ".join(FAILS) if FAILS else "ALL ARP TESTS PASSED")
     return 1 if FAILS else 0

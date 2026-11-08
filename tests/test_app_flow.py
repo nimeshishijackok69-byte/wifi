@@ -30,6 +30,30 @@ def check(label, condition, detail=""):
         FAILS.append(label)
 
 
+def check_aliases() -> None:
+    """Fix 9: pure alias detection (no GUI needed)."""
+    devices = {
+        "E2:93:95:08:18:57": {"ip": "192.168.1.33", "hostname": "POCO-C55", "blocked": True},
+        "4C:AE:1C:21:30:29": {"ip": "192.168.1.1", "hostname": "Router", "blocked": False},
+    }
+    # Rotated phone: new randomised MAC, same IP + hostname.
+    raw = {
+        "AA:BB:CC:DD:EE:FF": {"ip": "192.168.1.33", "hostname": "POCO-C55"},
+        "4C:AE:1C:21:30:29": {"ip": "192.168.1.1", "hostname": "Router"},
+    }
+    out = appmod.find_mac_aliases(devices, raw, {"E2:93:95:08:18:57"}, set())
+    check("alias detected on rotation", len(out) == 1 and out[0][1] == "AA:BB:CC:DD:EE:FF", str(out))
+    # Different hostname -> not an alias (could be a takeover).
+    raw2 = {"AA:BB:CC:DD:EE:FF": {"ip": "192.168.1.33", "hostname": "Someone-Else"}}
+    out2 = appmod.find_mac_aliases(devices, raw2, {"E2:93:95:08:18:57"}, set())
+    check("alias refused on hostname mismatch", out2 == [], str(out2))
+    # Still-online old MAC -> not an alias.
+    raw3 = {"E2:93:95:08:18:57": {"ip": "192.168.1.33", "hostname": "POCO-C55"},
+            "AA:BB:CC:DD:EE:FF": {"ip": "192.168.1.33", "hostname": "POCO-C55"}}
+    out3 = appmod.find_mac_aliases(devices, raw3, {"E2:93:95:08:18:57"}, set())
+    check("no alias while old MAC online", out3 == [], str(out3))
+
+
 def pump(app, seconds: float) -> None:
     end = time.time() + seconds
     while time.time() < end:
@@ -48,6 +72,7 @@ def wait_for(app, predicate, timeout: float) -> bool:
 
 
 def main() -> int:
+    check_aliases()
     appmod.messagebox.askyesno = lambda *a, **k: True
     appmod.messagebox.showerror = lambda *a, **k: print("  [dialog]", a[1] if len(a) > 1 else a)
     appmod.messagebox.showinfo = lambda *a, **k: None

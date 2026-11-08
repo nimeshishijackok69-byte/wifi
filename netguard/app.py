@@ -57,6 +57,49 @@ def human(ts: float) -> str:
     return time.strftime("%d %b %Y, %H:%M", time.localtime(ts))
 
 
+def find_mac_aliases(
+    devices: dict[str, dict],
+    raw: dict[str, dict],
+    blocked_macs: set[str],
+    arp_blocked: set[str],
+) -> list[tuple[str, str, str, str]]:
+    """Detect randomised-MAC rotation for blocked devices (Fix 9).
+
+    Pure function (no GUI) so it is unit-testable. A rotation is claimed
+    only on strong evidence: the blocked MAC is gone this scan, a new MAC
+    is online at the *same IP* with the *same DHCP hostname*, and at least
+    one of the two MACs is locally-administered (randomised). IP alone is
+    never enough — that is exactly the Fix 2 takeover case.
+    """
+    aliases: list[tuple[str, str, str, str]] = []
+    taken_new: set[str] = set()
+    for old_mac, rec in devices.items():
+        old_mac = normalize(old_mac)
+        if old_mac in raw:
+            continue
+        was_blocked = old_mac in blocked_macs or old_mac in arp_blocked or bool(rec.get("blocked"))
+        if not was_blocked:
+            continue
+        old_ip = rec.get("ip", "") or ""
+        old_host = (rec.get("hostname", "") or "").strip().lower()
+        if not old_host:
+            continue
+        for new_mac, info in raw.items():
+            new_mac = normalize(new_mac)
+            if new_mac in taken_new or new_mac in blocked_macs or new_mac in arp_blocked:
+                continue
+            if not info.get("ip") or info["ip"] != old_ip:
+                continue
+            if (info.get("hostname", "") or "").strip().lower() != old_host:
+                continue
+            if not (fingerprint.is_randomized(old_mac) or fingerprint.is_randomized(new_mac)):
+                continue
+            aliases.append((old_mac, new_mac, old_ip, old_host))
+            taken_new.add(new_mac)
+            break
+    return aliases
+
+
 # --------------------------------------------------------------------------
 # Row model
 # --------------------------------------------------------------------------
@@ -748,6 +791,22 @@ class NetGuardApp(tk.Tk):
             observed = {mac: info["ip"] for mac, info in raw.items() if info.get("ip")}
             self.arp.refresh_targets(observed)
 
+        # Fix 9: carry blocks across randomised-MAC rotation (same IP +
+        # same DHCP hostname + randomised MAC). ARP retargets in place;
+        # router blocks are swapped in a worker thread (network I/O).
+        try:
+            arp_set = {normalize(t["mac"]) for t in self.arp.targets}
+            aliases = find_mac_aliases(self.store.devices, raw, blocked, arp_set)
+        except Exception:
+            aliases = []
+        for old_mac, new_mac, ip, host in aliases:
+            if self.arp.is_blocking(old_mac):
+                self.arp.retarget(old_mac, new_mac, ip)
+                self.log_line(f"↻ Forced-offline carried to rotated MAC {new_mac} ({host}, {ip}).")
+            if old_mac in blocked and self.router and self.router.logged_in:
+                self.log_line(f"↻ Router block carried to rotated MAC {new_mac} ({host}, {ip}).")
+                threading.Thread(target=self._reblock_rotated, args=(old_mac, new_mac), daemon=True).start()
+
         self.store.merge_scan(raw)
         now = time.time()
         new_macs = [mac for mac in raw if mac not in self.rows] if self.rows else []
@@ -1020,6 +1079,28 @@ class NetGuardApp(tk.Tk):
                 self.post(lambda m=message: self._block_done(row.mac, False, m, unblock))
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _reblock_rotated(self, old_mac: str, new_mac: str) -> None:
+        """Worker: swap a router block from a rotated MAC to the new one."""
+        try:
+            ok_old, _ = self.router.set_block(old_mac, False)
+            if not ok_old:
+                # Old slot may already be gone — still try to block the new MAC.
+                self.post(lambda: self.log_line(f"⚠ Could not clear dead MAC {old_mac} from filter; blocking {new_mac} anyway."))
+            ok, msg = self.router.set_block(new_mac, True)
+        except Exception as exc:
+            ok, msg = False, str(exc)
+        self.post(lambda: self._reblock_done(old_mac, new_mac, ok, msg))
+
+    def _reblock_done(self, old_mac: str, new_mac: str, ok: bool, msg: str) -> None:
+        if not ok:
+            self.log_line(f"⚠ Rotated-MAC re-block failed for {new_mac}: {msg} — block the new row manually.")
+            return
+        self.store.record(old_mac)["blocked"] = False
+        self.store.record(new_mac)["blocked"] = True
+        self.store.save_devices()
+        self.log_line(f"✓ Router block moved {old_mac} -> {new_mac}.")
+        self.render()
 
     def _block_done(self, mac: str, ok: bool, message: str, unblock: bool) -> None:
         verb = "unblocked" if unblock else "blocked"
